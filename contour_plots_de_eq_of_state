@@ -1,0 +1,96 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+import camb
+from pprint import pprint
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+# ---------- Cosmological parameters ---------- #
+h, omegabh2, omegach2 = 0.6756, 0.022, 0.12
+As, ns = 2.215e-9, 0.962
+tau, YHe = 0.0544, 0.246
+
+# ---------- 1. Grids ---------- #
+a_grid      = np.logspace(-3, 0, 4000)                 # scale‑factor grid
+alphas      = np.linspace(-1.0,  1.0, 10)              
+phi_grid    = np.linspace( 7, 20.0, 10)                
+phi_dot_grid= np.linspace(-154, 500, 10)               
+# phidot_zoom_grid = np.linspace(-152, -50, 100)         # zoom region (not used)
+
+# ---------- 2. CAMB call cache ---------- #
+_cache = {}                                            # {(phi_i,phi_dot_i,alpha): result}
+
+def camb_result(phi_i=10.0, phi_dot_i=0.0, alpha=1.0):
+    key = (phi_i, phi_dot_i, alpha)
+    if key not in _cache:
+        pars = camb.set_params(
+            H0=100*h, ombh2=omegabh2, omch2=omegach2, TCMB=2.7255,
+            dark_energy_model='HybridQuintessence',
+            phi_i=phi_i, phi_prime_i=phi_dot_i, alpha=alpha,
+            omnuh2=0, num_nu_massless=3.044, num_nu_massive=0,
+            nu_mass_degeneracies=[0], nu_mass_numbers=[0],
+            As=As, ns=ns, tau=tau, YHe=YHe, WantTransfer=True)
+        pars.NonLinear = camb.model.NonLinear_none
+        _cache[key] = camb.get_results(pars)
+    return _cache[key]
+
+def w_eff(result, *, atol=1e-28):
+    global a_grid
+    rhos   = result.get_background_densities(a_grid)
+    H      = a_grid * result.h_of_z(1/a_grid - 1)
+    rho_de = rhos['de'] / a_grid**4
+    rho_cdm= rhos['cdm']/ a_grid**4
+    w_de   = result.get_dark_energy_rho_w(a_grid)[1]
+
+    de          = result.Params.DarkEnergy
+    φ_of_a      = interp1d(de.sampled_a,  de.phi_a,    kind='linear')(a_grid)
+    φdot_of_a   = interp1d(de.sampled_a,  de.phidot_a, kind='linear')(a_grid)
+    eps         = de.alpha * φdot_of_a * rho_cdm / (φ_of_a * 3*H * rho_de)
+
+    eps[rho_de < atol] = 0.0
+
+    return w_de + eps
+
+# ---------- 3. Fill the Z‑matrices ---------- #
+def fill_matrix(grid, vary='alpha'):
+    Z = np.empty((len(grid), len(a_grid)))
+    for i, val in enumerate(grid):
+        if vary == 'alpha':
+            res = camb_result(alpha=val)
+        elif vary == 'phi':
+            res = camb_result(phi_i=val, alpha=1.0) 
+        elif vary == 'phidot':
+            res = camb_result(phi_dot_i=val, alpha=1.0)
+        Z[i] = w_eff(res)
+    return Z
+
+Z_alpha      = fill_matrix(alphas,           vary='alpha')
+Z_phi        = fill_matrix(phi_grid,         vary='phi')
+Z_phidot     = fill_matrix(phi_dot_grid,     vary='phidot')
+#Z_zoom       = fill_matrix(phidot_zoom_grid, vary='phidot')
+
+# ---------- 4. Shared colour scale ---------- #
+vmin = min(Z_alpha.min(), Z_phi.min(), Z_phidot.min())
+vmax = max(Z_alpha.max(), Z_phi.max(), Z_phidot.max())
+levels = np.linspace(vmin, vmax, 50)
+
+# ---------- 5. Main plots ---------- #
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+grids = [(alphas,      Z_alpha,  r'$\alpha$'),
+         (phi_grid,    Z_phi,    r'$\phi_i ~/ ~M_{pl}$'),
+         (phi_dot_grid,Z_phidot, r"$\phi_i ' ~/~M_{pl}^2$")]
+
+for ax, (param, Z, ylabel) in zip(axes, grids):
+    X, Y = np.meshgrid(a_grid, param)
+    cf = ax.contourf(X, Y, Z, levels=levels, cmap='hot', extend='both')
+    ax.set_xscale('log')
+    ax.set_xlabel(r'Scale factor $a$')
+    ax.set_ylabel(ylabel)
+    ax.set_title(fr'$w_\mathrm{{eff}}(a)$ vs {ylabel}')
+
+# ---------- 6. Shared colorbar ---------- #
+cbar = fig.colorbar(cf, ax=axes, location='bottom', shrink=0.9,
+                    aspect=40, pad=0.07,
+                    label=r'Effective equation of state $w_\mathrm{eff}$')
+
+plt.show()
