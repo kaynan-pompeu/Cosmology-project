@@ -1,0 +1,142 @@
+from getdist import loadMCSamples, plots
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+
+# === Configuration ===
+
+# Directory containing the MCMC chain files.
+chain_dir = "./data/"
+
+"""
+# Example configuration for multiple chains (currently commented out).
+# Each entry specifies a label, root filename, color for plotting, and line style.
+chains = {
+    "Planck + BAO + PantheonPlus": {"root": "MCMC4", "color": "#74B0FF", "ls": "-"},
+    "BAO + PantheonPlus":            {"root": "MCMC2", "color": "#d62424", "ls": "--"},
+    "BAO only":                      {"root": "MCMC1", "color": "#000000", "ls": ":"}
+}
+"""
+
+# Configuration for the MCMC chains to be analyzed.
+# "root": base filename of the chain.
+# "color": color for plotting.
+# "ls": line style for plotting.
+chains = {
+    "Planck + BAO + PantheonPlus": {"root": "MCMC4", "color": "#2B85FC", "ls": "-"}
+}
+
+# List of parameters to include in summary statistics and plots.
+params = ['phi_i', 'H0', 'ns', 'omegabh2', 'omegach2', 'tau', 'sigma8', 'age']
+
+# === Functions ===
+
+def load_chain(root):
+    """
+    Loads an MCMC chain from a specified root filename.
+
+    Args:
+        root (str): The base filename of the MCMC chain (e.g., "MCMC4").
+
+    Returns:
+        getdist.MCSamples: An MCSamples object containing the loaded chain data.
+    """
+    path = os.path.join(chain_dir, root)
+    return loadMCSamples(file_root=path, settings={'ignore_rows': 0.0})
+
+def summarize_chain(label, samples):
+    """
+    Prints a summary of key statistics for specified parameters within an MCMC chain.
+
+    Args:
+        label (str): A label for the chain (e.g., "Planck + BAO + PantheonPlus").
+        samples (getdist.MCSamples): The MCSamples object containing the chain data.
+    """
+    print(f"\n===== {label} =====")
+    names = samples.getParamNames().list()  # Get all parameter names in the chain
+    weights = samples.weights             # Get the weights for each sample
+    data = samples.samples                # Get the raw sample data
+    best_idx = np.argmin(samples.loglikes) # Index of the sample with the minimum log-likelihood (best fit)
+    best = data[best_idx, :]              # The best-fit parameter values
+
+    for i, name in enumerate(names):
+        if name in params:  # Only process parameters listed in our 'params' configuration
+            try:
+                mean = np.average(data[:, i], weights=weights)
+                std = np.sqrt(np.average((data[:, i] - mean)**2, weights=weights))
+                dens = samples.get1DDensity(name) # Get 1D marginalized density for confidence limits
+                lims_68 = dens.getLimits(0.68)    # 68% confidence limits
+                lims_95 = dens.getLimits(0.95)    # 95% confidence limits
+
+                print(f"{name:10} | mean = {mean:.4f} ± {std:.4f} | "
+                      f"68% C.L. = [{lims_68[0]:.4f}, {lims_68[1]:.4f}] | "
+                      f"95% C.L. = [{lims_95[0]:.4f}, {lims_95[1]:.4f}] | "
+                      f"best = {best[i]:.4f}")
+            except Exception as e:
+                print(f"{name:10} | Error: {e}")
+
+def generate_triangle_plot(sample_dict, param_list):
+    """
+    Generates and displays a triangle plot (corner plot) for selected parameters from multiple MCMC chains.
+
+    Args:
+        sample_dict (dict): A dictionary where keys are chain labels and values are
+                            dictionaries containing 'samples' (MCSamples object)
+                            and plotting information ('color', 'ls').
+        param_list (list): A list of parameter names to include in the plot.
+    """
+    print("\nGenerating triangle plot...")
+    plt.close('all') # Close any existing matplotlib figures
+    
+    # Initialize GetDist plotter with specified width.
+    g = plots.get_subplot_plotter(width_inch=10)
+    
+    # Configure plot settings for labels, fonts, and transparency.
+    g.settings.axes_fontsize = 12
+    g.settings.lab_fontsize = 16
+    g.settings.legend_fontsize = 14
+    g.settings.alpha_filled_add = 0.5 # Transparency for filled contours
+
+    samples = []        # List to hold MCSamples objects for plotting
+    filled = []         # List to control which contours are filled
+    colors = []         # List of colors for each chain
+    line_args = []      # List of line arguments (color, line width, line style)
+    legend_labels = []  # List of labels for the plot legend
+
+    for idx, (label, info) in enumerate(sample_dict.items()):
+        samples.append(info["samples"])
+        filled.append(idx == 0)  # Only fill the contours for the first chain
+        colors.append(info["color"])
+        line_args.append({"color": info["color"], "lw": 1.8, "ls": info["ls"]})
+        legend_labels.append(label)
+
+    # Generate the triangle plot.
+    g.triangle_plot(
+        samples,
+        param_list,
+        filled=filled,
+        contour_colors=colors,
+        line_args=line_args,
+        legend_labels=legend_labels
+    )
+    plt.tight_layout() # Adjust plot to prevent labels from overlapping
+    plt.show()         # Display the plot
+
+# === Execution ===
+
+# Loop through each defined chain, load its samples, and summarize them.
+for label, info in chains.items():
+    samples = load_chain(info["root"])
+    info["samples"] = samples  # Store the loaded samples back in the 'chains' dictionary
+    summarize_chain(label, samples)
+
+# Determine common parameters present in all loaded chains for consistent plotting.
+common_params = [
+    p for p in params if all(p in chains[c]["samples"].getParamNames().list() for c in chains)
+]
+
+# Generate a triangle plot if there are enough common parameters to create one.
+if len(common_params) >= 2:
+    generate_triangle_plot(chains, common_params)
+else:
+    print("Not enough shared parameters across chains for a triangle plot.")
