@@ -238,8 +238,8 @@ def plot_dark_energy_ratio(ax, all_results, sf_array, cases_labels, ls_styles, l
             rhos_hq = result.get_background_densities(sf_array)
             rho_phi_series = rhos_hq['de']
 
-            ratio = rho_phi_series / (rho_lambda_series + np.finfo(float).eps)
-            log_ratio = np.log10(ratio + np.finfo(float).eps)
+            ratio = rho_phi_series / (rho_lambda_series)
+            log_ratio = np.log10(ratio)
 
             ax.plot(log_sf_array, log_ratio, ls=current_ls, lw=current_lw, label=model_label)
 
