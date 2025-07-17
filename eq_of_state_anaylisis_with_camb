@@ -1,0 +1,424 @@
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import interp1d
+import camb
+import logging
+from typing import Tuple, List, Dict, Any, Optional
+
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- Helper Functions ---
+
+def setup_camb_params(h_val: float, omegabh2_val: float, omegach2_val: float, As_val: float, ns_val: float,
+                      phi_i_val: float, phi_prime_i_val: float, alpha_val: float) -> camb.CAMBparams:
+    """Configures and returns CAMB parameters for the Hybrid Quintessence model."""
+    params = camb.set_params(
+        H0=100 * h_val, ombh2=omegabh2_val, omch2=omegach2_val, TCMB=2.7255,
+        dark_energy_model='HybridQuintessence',
+        phi_i=phi_i_val, phi_prime_i=phi_prime_i_val, alpha=alpha_val,
+        omnuh2=0, num_nu_massless=3.044, num_nu_massive=0,
+        nu_mass_degeneracies=[0], nu_mass_numbers=[0],
+        As=As_val, ns=ns_val, tau=0.0544,
+        YHe=0.246, WantTransfer=True
+    )
+    params.NonLinear = camb.model.NonLinear_none
+    return params
+
+def calculate_background_quantities(results: camb.CAMBdata, scale_factor_arr: np.ndarray) -> Dict[str, np.ndarray]:
+    """Calculates and returns relevant background quantities from CAMB results."""
+    rhos = results.get_background_densities(scale_factor_arr)
+    H = scale_factor_arr * results.h_of_z(1 / scale_factor_arr - 1)
+    _, w_de = results.get_dark_energy_rho_w(scale_factor_arr)
+    rho_de = rhos['de'] / scale_factor_arr**4
+    rho_cdm = rhos['cdm'] / scale_factor_arr**4
+
+    de = results.Params.DarkEnergy
+    # Ensure interpolation is done on the full scale_factor_arr array
+    phi_interpolator = interp1d(de.sampled_a, de.phi_a, bounds_error=False, fill_value="extrapolate")
+    phi_prime_interpolator = interp1d(de.sampled_a, de.phidot_a, bounds_error=False, fill_value="extrapolate")
+    phi = phi_interpolator(scale_factor_arr)
+    phi_prime = phi_prime_interpolator(scale_factor_arr)
+
+    return {
+        'H': H,
+        'w_de': w_de,
+        'rho_de': rho_de,
+        'rho_cdm': rho_cdm,
+        'phi': phi,
+        'phi_prime': phi_prime,
+        'de_params': de # Keep dark energy parameters for alpha access
+    }
+
+def find_critical_point(scale_factor_arr: np.ndarray, phi_prime_arr: np.ndarray) -> float:
+    """
+    Calculates the critical point for the scalar field derivative where it changes sign.
+    Returns 0.0 if no such crossing is found.
+    """
+    idx = np.where(np.diff(np.sign(phi_prime_arr)))[0]
+    if len(idx) > 0:
+        c = idx[0]
+        a_c = (scale_factor_arr[c] + scale_factor_arr[c+1]) / 2
+        return a_c
+    return 0.0
+
+def find_phantom_crossings(scale_factor_arr: np.ndarray, w_eff_arr: np.ndarray) -> List[float]:
+    """Finds points where w_eff crosses -1."""
+    crossings = []
+    # Find indices where w_eff crosses -1
+    idx_cross = np.where(np.diff(np.sign(w_eff_arr - (-1))))[0]
+
+    for i in idx_cross:
+        a_cross = (scale_factor_arr[i] + scale_factor_arr[i+1]) / 2
+        crossings.append(1 / a_cross - 1) # Convert to redshift
+
+    return crossings
+
+def plot_cosmology_dynamics(
+    scale_factor_arr: np.ndarray,
+    results_data: Dict[str, Any],
+    alpha_val: float,
+    phi_i_val: float,
+    phi_prime_i_val: float,
+    color: str,
+    fig: plt.Figure,
+    axs: Tuple[plt.Axes, plt.Axes, plt.Axes]
+):
+    """Plots the equation of state, scalar field, and scalar field velocity."""
+    ax1, ax2, ax3 = axs
+    H = results_data['H']
+    w_de = results_data['w_de']
+    rho_de = results_data['rho_de']
+    rho_cdm = results_data['rho_cdm']
+    phi = results_data['phi']
+    phi_prime = results_data['phi_prime']
+    de_params = results_data['de_params']
+
+    # Effective equation of state
+    w_eff = w_de + de_params.alpha * phi_prime * rho_cdm / (phi * 3 * H * rho_de)
+
+    # Critical point for phi_prime
+    a_c = find_critical_point(scale_factor_arr, phi_prime)
+    logging.info(f'a_critical = {a_c:.5e}')
+
+    # Phantom crossings
+    phantom_crossings_z = find_phantom_crossings(scale_factor_arr, w_eff)
+    if phantom_crossings_z:
+        logging.info(f"Phantom crossings at redshifts (z): {phantom_crossings_z}")
+    else:
+        logging.info("No phantom crossing found.")
+
+    # --- Plot EoS ---
+    label = fr"$\alpha = {alpha_val}$"
+    ax1.semilogx(scale_factor_arr, w_de, ls='--', color=color)
+    ax1.semilogx(scale_factor_arr, w_eff, ls='-', color=color, label=label)
+    ax1.axhline(-1, color='grey', linestyle=':', lw=1, alpha=0.3) # Horizontal line for w=-1
+
+    # Annotate phantom crossing if found
+    if phantom_crossings_z:
+        z_p = phantom_crossings_z[0] # Take the first crossing
+        a_p = 1 / (1 + z_p)
+        # Find w_eff value at a_p (or closest point)
+        w_p_idx = np.argmin(np.abs(scale_factor_arr - a_p))
+        w_p = w_eff[w_p_idx]
+
+        # Define radii for the circle annotation
+        log_a_p = np.log10(a_p)
+        radius_log_a = 0.1
+        radius_w = 0.05
+
+        theta = np.linspace(0, 2 * np.pi, 200)
+        circle_log_x = log_a_p + radius_log_a * np.cos(theta)
+        circle_x = 10**circle_log_x # Convert back to linear scale for plotting on semilogx
+        circle_y = w_p + radius_w * np.sin(theta)
+
+        ax1.plot(circle_x, circle_y, color='red', lw=2)
+
+        ax1.annotate(
+            f"$z \\approx {z_p:.2f}$\n$w \\approx {w_p:.2f}$",
+            xy=(a_p, w_p),
+            xytext=(a_p * 1.5, w_p + 0.5), # Adjust text position
+            arrowprops=dict(arrowstyle="->", color='black', lw=1),
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9),
+        )
+
+    # --- Plot phi ---
+    ax2.semilogx(scale_factor_arr, phi / phi_i_val, color=color, label=label)
+
+    # --- Plot phi' ---
+    ax3.loglog(scale_factor_arr, np.abs(phi_prime) / phi_prime_i_val, color=color, label=label)
+
+    # --- Add vertical lines and shading ---
+    if a_c > 0: # Only add if a critical point was found
+        for ax_elem in (ax1, ax2, ax3):
+            ax_elem.axvline(x=a_c, color='gray', linestyle=':', linewidth=1)
+            ax_elem.axvspan(scale_factor_arr[0], a_c, color='blue', alpha=0.08)
+            ax_elem.axvspan(a_c, scale_factor_arr[-1], color='green', alpha=0.08)
+
+        # Add dynamic phase description (only for ax2 and ax3)
+        log_a = np.log10(scale_factor_arr)
+        log_a_min = log_a.min()
+        log_a_max = log_a.max()
+        log_ac = np.log10(a_c)
+        dx = log_a_max - log_a_min
+
+        for ax_elem in (ax2, ax3):
+            ax_elem.text(
+                10**(log_ac - 0.35 * dx), 0.05, "Field climbing up",
+                transform=ax_elem.get_xaxis_transform(),
+                fontsize=12, color='blue',
+                verticalalignment='bottom', horizontalalignment='left',
+                alpha=1
+            )
+            ax_elem.text(
+                10**(log_ac + 0.35 * dx), 0.05, "Slow-rolling down",
+                transform=ax_elem.get_xaxis_transform(),
+                fontsize=12, color='green',
+                verticalalignment='bottom', horizontalalignment='right',
+                alpha=1
+            )
+
+def plot_phantom_phase_analysis(
+    phis_prime_values: np.ndarray,
+    z_in_list: List[float],
+    z_out_list: List[float],
+    delta_z_list: List[float],
+    scale_factor_arr: np.ndarray,
+    w_de_for_plot: np.ndarray,
+    w_eff_for_plot: np.ndarray,
+    crossings_for_plot: List[float],
+    phi_prime_i_for_plot: float # Added for clarity in plot title/label
+):
+    """Plots the equation of state with phantom crossings and phantom phase duration."""
+
+
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Left plot: w_eff(a) ---
+    ax = axs[0]
+    ax.semilogx(scale_factor_arr, w_eff_for_plot, label=fr"$\phi'_i = {phi_prime_i_for_plot:.0e}$", color='darkblue')
+    ax.semilogx(scale_factor_arr, w_de_for_plot, label=r"$w_\phi$", color='green', ls='--')
+    ax.axhline(-1, color='gray', linestyle='--', lw=1)
+
+    if len(crossings_for_plot) == 2:
+        z_in_plot, z_out_plot = crossings_for_plot[0], crossings_for_plot[1]
+        a_in = 1 / (z_in_plot + 1)
+        a_out = 1 / (z_out_plot + 1)
+        ax.plot(a_in, -1, 'ro', label=rf"$z_\mathrm{{in}} \approx {z_in_plot:.2f}$")
+        ax.plot(a_out, -1, 'go', label=rf"$z_\mathrm{{out}} \approx {z_out_plot:.2f}$")
+        delta_z_val = z_in_plot - z_out_plot
+        ax.text(0.01, -1.4, rf"$\Delta z = z_{{\mathrm{{in}}}} - z_{{\mathrm{{out}}}} \approx {delta_z_val:.2f}$", fontsize=10)
+
+    # --- Find and plot critical points of w_de ---
+    # Approximate derivative of w_de
+    w_de_diff = np.diff(w_de_for_plot)
+
+    # Find indices where the sign of the derivative changes
+    critical_indices_w_de = np.where(np.diff(np.sign(w_de_diff)))[0]
+
+    logging.info("\nCritical points of w_de curve:")
+    critical_points_found_and_plotted = 0 # Counter to ensure label is added only once
+    epsilon = 1e-4 # Tolerance for ignoring points near w_de = 1 or w_de = -1
+
+    for idx in critical_indices_w_de:
+        # Interpolate to find the exact critical point
+        # Take the average of the scale factors and w_de values around the sign change
+        a_crit = (scale_factor_arr[idx] + scale_factor_arr[idx+1]) / 2
+        w_de_crit = (w_de_for_plot[idx] + w_de_for_plot[idx+1]) / 2
+
+        # Check if w_de_crit is approximately 1 or -1
+        if not (np.isclose(w_de_crit, 1.0, atol=epsilon) or np.isclose(w_de_crit, -1.0, atol=epsilon)):
+            logging.info(f"  Critical point found: (a={a_crit:.4e}, w_de={w_de_crit:.4f})")
+
+            plot_label = 'Critical Points of $w_\phi$' if critical_points_found_and_plotted == 0 else '_nolegend_'
+
+            # Plot the critical point
+            ax.plot(a_crit, w_de_crit, 'X', color='purple', markersize=8, label=plot_label)
+
+            # Draw a vertical line through the critical point
+            ax.axvline(x=a_crit, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
+            critical_points_found_and_plotted += 1
+        else:
+            logging.info(f"  Ignored critical point at (a={a_crit:.4e}, w_de={w_de_crit:.4f}) because w_de is ~1 or ~-1.")
+
+    if critical_points_found_and_plotted == 0:
+        logging.info("  No critical points for w_de found, or all were ignored near w_de = 1 or -1.")
+
+
+    ax.set_xlabel("Scale factor $a$", fontsize=12)
+    ax.set_ylabel(r"$w$", fontsize=12)
+    ax.set_title(r"Equation of State with Phantom Crossings", fontsize=13)
+    ax.set_ylim([-1.5, 1.2])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+
+    # --- Right plot: z_in, z_out and ∆z ---
+    ax = axs[1]
+    ax.plot(phis_prime_values, z_in_list, 'o-', label=r"$z_\mathrm{in}$", color='red')
+    ax.plot(phis_prime_values, z_out_list, 'o-', label=r"$z_\mathrm{out}$", color='green')
+    ax.plot(phis_prime_values, delta_z_list, 'o-', label=r"$\Delta z$", color='black')
+    ax.set_yscale('log')
+    ax.set_xlabel(r"Initial scalar speed $\phi'_i$", fontsize=12)
+    ax.set_ylabel(r"Redshift", fontsize=12)
+    ax.set_title(r"Phantom Phase Duration", fontsize=13)
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    """Main function to execute the cosmological simulations and plotting."""
+
+    # --- Cosmological parameters ---
+    h = 0.6756
+    omegabh2 = 0.022
+    omegach2 = 0.12
+    As = 2.215e-9
+    ns = 0.962
+
+    # --- Scale factor array ---
+    scale_factor = np.logspace(-6, 0, 10**6) # resolution is important, why camb starts at 1e-7 anyway?
+
+    # --- Scalar field initial conditions for the main plot ---
+    phi_i_main = 10
+    phi_prime_i_main = 1e6
+    alpha_main = 1
+
+    # --- Set up plot colors (though only one alpha is used for this part) ---
+    cmap = plt.get_cmap('tab10')
+    colors = [cmap(i) for i in np.linspace(0, 1, 1)] # Only need one color
+
+    # --- First Plot: Cosmology Dynamics for single alpha ---
+    fig1, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5), sharex=True)
+
+    logging.info(f"Running CAMB for alpha={alpha_main} (Main Plot)...")
+    params = setup_camb_params(h, omegabh2, omegach2, As, ns, phi_i_main, phi_prime_i_main, alpha_main)
+    camb_results_main = camb.get_results(params)
+    background_data_main = calculate_background_quantities(camb_results_main, scale_factor)
+
+    plot_cosmology_dynamics(
+        scale_factor, background_data_main, alpha_main, phi_i_main, phi_prime_i_main,
+        colors[0], fig1, (ax1, ax2, ax3)
+    )
+
+    # --- Axis formatting for ax1 ---
+    ax1.set_xlabel("Scale factor $a$", fontsize=12)
+    ax1.set_ylabel(r"$w$", fontsize=12)
+    ax1.set_ylim([-1.5, 1.5])
+    ax1.set_title(r"Equation of State", fontsize=13)
+    ax1.grid(True, alpha=0.3)
+
+    custom_lines = [
+        mpl.lines.Line2D([0], [0], color="black", lw=1, ls='-'),
+        mpl.lines.Line2D([0], [0], color="black", lw=1, ls='--'),
+    ]
+    ax1.legend(handles=custom_lines, labels=[r"$w_\mathrm{eff}$", r"$w_\phi$"], loc="upper right", fontsize=10)
+
+    # --- Axis formatting for ax2 ---
+    ax2.set_xlabel("Scale factor $a$", fontsize=12)
+    ax2.set_ylabel(r"$\phi / \phi_i$", fontsize=12)
+    ax2.set_title(r"Scalar Field Evolution", fontsize=13)
+    ax2.grid(True, alpha=0.3)
+
+    # --- Axis formatting for ax3 ---
+    ax3.set_xlabel("Scale factor $a$", fontsize=12)
+    ax3.set_ylabel(r"$|\phi '| / \phi_i '$", fontsize=12)
+    ax3.set_title(r"Scalar Field Velocity", fontsize=13)
+    ax3.grid(True, alpha=0.3)
+
+    # --- Add parameter box to ax3 ---
+    param_text = (
+        r"$\phi_i = %.1f$" "\n"
+        r"$\phi'_i = %.0e$" "\n"
+        r"$\alpha = %.3f$"
+    ) % (phi_i_main, phi_prime_i_main, alpha_main)
+
+    ax3.text(
+        0.83, 0.8, param_text,
+        transform=ax3.transAxes,
+        fontsize=10,
+        verticalalignment='bottom',
+        bbox=dict(boxstyle="round,pad=0.4", edgecolor='black', facecolor='white', alpha=0.8)
+    )
+    plt.tight_layout()
+    plt.show()
+
+    # --- Density Ratio Calculation at a target redshift ---
+    z_target = 1.5
+    a_target = 1 / (1 + z_target)
+
+    # Use interpolators from the main run's background_data
+    rho_cdm_interp = interp1d(scale_factor, background_data_main['rho_cdm'], bounds_error=False, fill_value="extrapolate")
+    rho_de_interp = interp1d(scale_factor, background_data_main['rho_de'], bounds_error=False, fill_value="extrapolate")
+
+    rho_chi_val = rho_cdm_interp(a_target)
+    rho_de_val = rho_de_interp(a_target)
+
+    ratio = rho_chi_val / rho_de_val
+    logging.info(f"\nAt z = {z_target}, a = {a_target:.4f}")
+    logging.info(f"rho_chi / rho_de = {ratio:.5e}")
+
+    # --- Second Plot: Phantom Phase Duration Analysis ---
+    phis_prime_values = np.linspace(1e4, 1e5, 5) # Adjust the range and number of points as needed
+    z_in_list = []
+    z_out_list = []
+    delta_z_list = []
+
+    logging.info("\nAnalyzing phantom phase duration for varying initial scalar speeds...")
+    for i, phi_p_val in enumerate(phis_prime_values):
+        if (i + 1) % 10 == 0: # Log progress every 10 iterations
+            logging.info(f"  Processing {i+1}/{len(phis_prime_values)}: phi'_i = {phi_p_val:.0f}")
+
+        params = setup_camb_params(h, omegabh2, omegach2, As, ns, phi_i_main, phi_p_val, alpha_main)
+        camb_results_loop = camb.get_results(params)
+        background_data_loop = calculate_background_quantities(camb_results_loop, scale_factor)
+
+        # Recalculate w_eff for this loop iteration
+        w_eff_loop = background_data_loop['w_de'] + background_data_loop['de_params'].alpha * \
+                     background_data_loop['phi_prime'] * background_data_loop['rho_cdm'] / \
+                     (background_data_loop['phi'] * 3 * background_data_loop['H'] * background_data_loop['rho_de'])
+
+        crossings = find_phantom_crossings(scale_factor, w_eff_loop)
+
+        # Store z_in and z_out, handling cases where fewer than 2 crossings are found
+        if len(crossings) == 2:
+            # Assuming crossings are returned in increasing order of scale factor (decreasing redshift)
+            # So, the first crossing is z_in (higher redshift), second is z_out (lower redshift)
+            z_in, z_out = crossings[0], crossings[1]
+        elif len(crossings) == 1:
+            z_in, z_out = crossings[0], np.nan # Only one crossing, assume it's z_in
+        else: # No crossings or more than two
+            z_in, z_out = np.nan, np.nan
+
+        z_in_list.append(z_in)
+        z_out_list.append(z_out)
+        delta_z_list.append(z_in - z_out if np.isfinite(z_in) and np.isfinite(z_out) else np.nan)
+
+    # w_eff for the left plot of the second figure comes from the main run
+    w_de_for_plot = background_data_main['w_de']
+    w_eff_for_plot_main_run = background_data_main['w_de'] + background_data_main['de_params'].alpha * \
+                              background_data_main['phi_prime'] * background_data_main['rho_cdm'] / \
+                              (background_data_main['phi'] * 3 * background_data_main['H'] * background_data_main['rho_de'])
+
+    crossings_for_plot_main_run = find_phantom_crossings(scale_factor, w_eff_for_plot_main_run)
+
+    plot_phantom_phase_analysis(
+        phis_prime_values, z_in_list, z_out_list, delta_z_list,
+        scale_factor, w_de_for_plot, w_eff_for_plot_main_run, crossings_for_plot_main_run, phi_prime_i_main
+    )
+
+if __name__ == "__main__":
+    main()
+
+# this is the main program used to plot and analyze the dynamics of the equation of state in the hybrid quintessence model.
+# It sets up the CAMB parameters, runs the simulations, calculates background quantities, and generates plots to visualize the evolution of the scalar field, its velocity, and the effective equation of state.
+# The program also analyzes the phantom phase duration by varying the initial scalar field velocity and plotting the results.
+# It includes detailed logging to track the progress and results of the calculations.
+# The plots generated include the equation of state, scalar field evolution, and phantom phase analysis,
+# providing insights into the dynamics of the model across different initial conditions.
+# The program is designed to be run as a standalone script, and it uses the CAMB library for cosmological calculations.
+# The results are visualized using Matplotlib.
