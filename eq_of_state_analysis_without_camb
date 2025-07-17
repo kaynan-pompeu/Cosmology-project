@@ -1,0 +1,620 @@
+import numpy as np
+from scipy.integrate import odeint
+import matplotlib.pyplot as plt
+import logging
+from typing import List, Dict, Any, Tuple
+
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- Fixed cosmological parameters from Planck 2018 ---
+h = 0.6756
+omega_c = 0.12 / h**2
+omega_b = 0.022 / h**2
+omega_phot = 2.47e-5 / h**2
+omega_massless_nu = 3 * (7 / 8) * (4 / 11)**(4 / 3) * omega_phot
+omega_r = omega_phot + omega_massless_nu
+omega_de = 1 - omega_c - omega_b - omega_r
+
+# Normalization constant for densities. Value '3' is from the user's original code. 
+rho_cr = 3 # indicates units of Mpl/H, still a confusing point in the code. 
+
+# --- Core Equations of the Cosmological Model ---
+
+def H_curly(y: List[float], a: float, V0: float, rho_dm: float) -> float:
+    """Calculates the conformal Hubble parameter H*a for the given state."""
+    _, phi_prime = y
+    rho_phi = phi_prime**2 / (2 * a**2) + V0
+    rho = rho_cr * (omega_r * a**(-4) + omega_b * a**(-3)) + rho_dm + rho_phi
+    return a * np.sqrt(rho / 3)
+
+def equations(y: List[float], a: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations for the scalar field (phi, phi_prime).
+    Includes coupling of dark matter density to the scalar field.
+    """
+    phi, phi_prime = y
+    # Dark matter density coupled to the scalar field
+    rho_dm = rho_dm_i * (phi / phi_i) * (a_i / a)**3
+    H = H_curly(y, a, V0, rho_dm)
+    dphi = phi_prime / (a * H)
+    dphi_prime = -2 * phi_prime / a - a * rho_dm / (phi * H)
+    return np.array([dphi, dphi_prime])
+
+def equations_loga(y: List[float], loga: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations with respect to log(a).
+    Used for integration at very early times.
+    """
+    a = np.exp(loga)
+    derivs = equations(y, a, V0, rho_dm_i, a_i, phi_i)
+    return a * derivs
+
+def integrate_cosmo(ic: List[float], a_ini: float, a_end: float, n_steps: int, V0: float, rho_dm_i: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Integrates the cosmological equations using a hybrid approach:
+    log-integration for early universe and normal integration for later times.
+    """
+    frac = 0.4  # Fraction of time-steps spent in log integration
+    a_threshold = 1e-3  # Scale factor to switch integration methods
+    phi_i = ic[0]
+
+    logging.debug(f"integrate_cosmo called with ic={ic}, a_ini={a_ini}, a_end={a_end}") # Debug print
+
+    n_steps_log = int(frac * n_steps)
+    a_log = np.logspace(np.log10(a_ini), np.log10(a_threshold), n_steps_log)
+    loga = np.log(a_log)
+    result_log = odeint(equations_loga, ic, loga, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    ic_normal_integration = result_log[-1]  # Initial conditions for normal integration
+    a_normal = np.linspace(a_threshold, a_end, n_steps - n_steps_log)
+    result_normal = odeint(equations, ic_normal_integration, a_normal, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    return np.concatenate((a_log, a_normal)), np.concatenate((result_log, result_normal))
+
+def find_fracs_de_dm_0(result: np.ndarray, V0: float, rho_dm_0: float) -> Tuple[float, float]:
+    """Calculates the dark energy and dark matter fractions at a=1 (present day)."""
+    _, phi_prime = result.T
+    rho_phi_0 = phi_prime[-1]**2 / 2 + V0
+    
+    # Total density at a=1 (rho_r and rho_b are at a=1, so a**(-4) and a**(-3) become 1)
+    rho_tot_0 = rho_cr * (omega_r + omega_b) + rho_dm_0 + rho_phi_0
+    
+    return rho_phi_0 / rho_tot_0, rho_dm_0 / rho_tot_0
+
+def solve_system(
+    ic_phi: float, 
+    ic_phi_prime: float, # New parameter for initial phi_prime
+    a_ini: float, 
+    a_end: float, 
+    n_steps: int,
+    V0_guess_1: float, # New parameter for first V0 guess
+    V0_guess_2: float  # New parameter for second V0 guess
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """
+    Solves the cosmological system using a shooting method to find V0 that matches
+    the present-day dark energy density (omega_de).
+    """
+    logging.info("-----")
+    phi_i = ic_phi
+    logging.info(f"Begin shooting for phi_i = {phi_i}, phi_prime_i = {ic_phi_prime}")
+    logging.info(f"Target omega_de: {omega_de:.6f}; Target omega_c = {omega_c:.6f}")
+
+    # Initial conditions for odeint
+    ic = [ic_phi, ic_phi_prime]
+
+    # Initial guesses for shooting parameters (now passed as arguments)
+    V0_1 = V0_guess_1
+    V0_2 = V0_guess_2
+
+    # Initial guess for rho_dm_i assumes no (phi/phi_i) factor
+    rho_dm_i_guess = rho_cr * omega_c * a_ini**(-3)
+    rho_dm_i = rho_dm_i_guess
+    
+    # Integrate KG with initial guesses
+    a, result_1 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_1, rho_dm_i)
+    _, result_2 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_2, rho_dm_i)
+    
+    # Correct missing phi/phi_i factor for rho_dm_i (based on current phi_0)
+    # This recalculates rho_dm_i to ensure rho_dm(a=1) matches omega_c.
+    phi_0_1 = result_1.T[0][-1]
+    phi_0_2 = result_2.T[0][-1]
+    # Update rho_dm_i based on the first guess's phi_0 for consistency in the loop
+    rho_dm_i = rho_dm_i_guess * (phi_i / phi_0_1) 
+
+    # Evaluate omega_c and omega_de for initial guesses at a=1
+    # rho_dm_0 is calculated at a=1, so (a_ini/a)**3 becomes (a_ini/1)**3
+    rho_dm_0_1 = rho_dm_i_guess * (phi_0_1 / phi_i) * (a_ini)**3 # Use rho_dm_i_guess for a consistent initial calculation
+    rho_dm_0_2 = rho_dm_i_guess * (phi_0_2 / phi_i) * (a_ini)**3
+
+    omega_de_1, omega_c_1 = find_fracs_de_dm_0(result_1, V0_1, rho_dm_0_1)
+    omega_de_2, omega_c_2 = find_fracs_de_dm_0(result_2, V0_2, rho_dm_0_2)
+    
+    # Assess errors at initial guesses
+    error_dm_1 = (omega_c_1 - omega_c) / omega_c
+    error_dm_2 = (omega_c_2 - omega_c) / omega_c
+    error_de_1 = (omega_de_1 - omega_de) / omega_de
+    error_de_2 = (omega_de_2 - omega_de) / omega_de
+
+    logging.info(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f} (error = {error_de_1:.6f}); omega_c = {omega_c_1:.6f} (error = {error_dm_1:.6f})")
+    logging.info(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f} (error = {error_de_2:.6f}); omega_c = {omega_c_2:.6f} (error = {error_dm_2:.6f})")
+
+    # Check if initial guesses encapsulate the solution for omega_de
+    encapsulating = (omega_de_1 - omega_de) * (omega_de_2 - omega_de) < 0
+    if not encapsulating:
+        logging.warning("WARNING: initial guesses for V0 did not encapsulate the target omega_de")
+        logging.warning(f"Target omega_de: {omega_de}")
+        logging.warning(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f}")
+        logging.warning(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f}")
+    
+    iters = 0
+    max_iters = 20
+    # Secant method iteration
+    while (iters < max_iters):
+        iters += 1
+
+        # Fit a line between (V0_1, omega_de_1) and (V0_2, omega_de_2)
+        a_line = (omega_de_2 - omega_de_1) / (V0_2 - V0_1)
+        b_line = omega_de_2 - a_line * V0_2
+
+        # Choose the point where the line would cross the target omega_de
+        V0_try = (omega_de - b_line) / a_line
+
+        # Integrate KG assuming this new V0
+        _, result_try = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_try, rho_dm_i)
+        phi_0_try = result_try.T[0][-1]
+        
+        # Evaluate omega_de and omega_c for new point
+        rho_dm_0_try = rho_dm_i_guess * (phi_0_try / phi_i) * (a_ini)**3 # Always use rho_dm_i_guess here
+        omega_de_try, omega_c_try = find_fracs_de_dm_0(result_try, V0_try, rho_dm_0_try)
+        
+        # Assess errors at new point
+        error = (omega_de_try - omega_de) / omega_de
+        error_omega_c = (omega_c_try - omega_c) / omega_c
+        logging.info(f"V0 = {V0_try:.6f} => omega_de = {omega_de_try:.6f} (error = {error:.6f}); omega_c = {omega_c_try:.6f} (error = {error_omega_c:.6f})")
+        
+        # Update rho_dm_i for next iteration based on the new phi_0
+        rho_dm_i = rho_dm_i_guess * (phi_i / result_try.T[0][-1])
+        
+        # Exit condition
+        if abs(error) < 1e-4:
+            break
+
+        # Substitute one of the initial V0 guesses by the new V0 guess
+        # This maintains the bracketing if it was initially present,
+        # or updates the points for secant method otherwise.
+        if (omega_de_try > omega_de):
+            V0_1 = V0_try
+            omega_de_1 = omega_de_try
+        else:
+            V0_2 = V0_try
+            omega_de_2 = omega_de_try
+        
+    if abs(error) > 1e-4: # Check if the loop exited due to max_iters
+        logging.warning(f"WARNING: reached max iterations in shooting with error = {error}")
+    else:
+        logging.info(f"Finished shooting successfully after {iters} iterations")
+    return a, result_try, V0_try, rho_dm_i
+
+def calculate_derived_quantities(
+    a: np.ndarray, 
+    result: np.ndarray, 
+    V0: float, 
+    rho_dm_i_for_case: float, 
+    a_ini: float, 
+    phi_initial_val_for_case: float
+) -> Dict[str, np.ndarray]:
+    """
+    Calculates various derived quantities (densities, equations of state)
+    from the integration results.
+    """
+    phi_a, phi_prime_a = result.T
+
+    # Calculate densities for the current model
+    rho_de_a = phi_prime_a**2 / (2 * a**2) + V0
+    rho_dm_a = rho_dm_i_for_case * (phi_a / phi_initial_val_for_case) * (a_ini / a)**3
+    rho_r_a = rho_cr * omega_r * a**(-4)
+    rho_b_a = rho_cr * omega_b * a**(-3)
+    
+    rho_tot_a = rho_r_a + rho_b_a + rho_dm_a + rho_de_a
+
+    # Calculate equation of state for dark energy
+    w_de_a = (phi_prime_a**2 / (2 * a**2) - V0) / rho_de_a
+
+    # Calculate H_curly (dimensionless Hubble parameter) for each a
+    # We need to calculate it using the values of phi_a and phi_prime_a at each step
+    H_curly_a = np.array([H_curly([phi_a[i], phi_prime_a[i]], a[i], V0, rho_dm_a[i]) for i in range(len(a))])
+
+    # Calculate effective equation of state using the provided expression
+    # w_eff = w_phi + (phi_prime / (3 * H_curly * phi)) * (rho_chi / rho_phi)
+    # Add a small epsilon to denominators to prevent division by zero for numerical stability
+    epsilon = 1e-15 
+
+    phi_a_safe = np.where(np.abs(phi_a) < epsilon, epsilon, phi_a)
+    H_curly_a_safe = np.where(np.abs(H_curly_a) < epsilon, epsilon, H_curly_a)
+    rho_de_a_safe = np.where(np.abs(rho_de_a) < epsilon, epsilon, rho_de_a)
+
+    # This is the coupling term for w_eff
+    coupling_term_a = (phi_prime_a / (3 * H_curly_a_safe * phi_a_safe)) * (rho_dm_a / rho_de_a_safe)
+    w_eff_a = w_de_a + coupling_term_a
+    
+    return {
+        'phi_a': phi_a,
+        'phi_prime_a': phi_prime_a,
+        'rho_de_a': rho_de_a,
+        'rho_dm_a': rho_dm_a,
+        'w_de_a': w_de_a,
+        'rho_tot_a': rho_tot_a,
+        'w_eff_a': w_eff_a,
+        'rho_r_a': rho_r_a,
+        'rho_b_a': rho_b_a,
+        'H_curly_a': H_curly_a, # Also store H_curly for completeness
+        'w_eff_coupling_term_a': coupling_term_a # Store the new term
+    }
+
+def detect_phantom_crossing(a: np.ndarray, w_eff: np.ndarray) -> Tuple[float, float] or None: # type: ignore
+    """
+    Detects if and where w_eff crosses the -1 line (phantom crossing).
+    Returns (crossing_a, crossing_z) if a crossing is found, otherwise None.
+    """
+    # Look for a sign change from w_eff > -1 to w_eff < -1
+    # We need to ensure w_eff is defined and not NaN
+    valid_indices = np.where(~np.isnan(w_eff))
+    a_valid = a[valid_indices]
+    w_eff_valid = w_eff[valid_indices]
+
+    for i in range(1, len(w_eff_valid)):
+        if w_eff_valid[i-1] > -1 and w_eff_valid[i] < -1:
+            # Linear interpolation to find the exact crossing point
+            a1, a2 = a_valid[i-1], a_valid[i]
+            w1, w2 = w_eff_valid[i-1], w_eff_valid[i]
+
+            # Solve for a where w_eff(a) = -1
+            # (w - w1) / (a - a1) = (w2 - w1) / (a2 - a1)
+            # (-1 - w1) / (a_cross - a1) = (w2 - w1) / (a2 - a1)
+            # a_cross - a1 = (-1 - w1) * (a2 - a1) / (w2 - w1)
+            # a_cross = a1 + (-1 - w1) * (a2 - a1) / (w2 - w1)
+            
+            if (w2 - w1) != 0: # Avoid division by zero if w_eff is flat
+                crossing_a = a1 + (-1 - w1) * (a2 - a1) / (w2 - w1)
+                crossing_z = (1 / crossing_a) - 1
+                return crossing_a, crossing_z
+    return None
+
+# --- Plotting Functions ---
+
+def plot_w_phi(results_dict: Dict[int, Dict[str, Any]], a_common: np.ndarray):
+    """Plots the scalar field equation of state (w_phi) for different phi_i values."""
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+
+    # Original code only plotted phi_i = 8, 10, 15, 20 for w_de
+    plot_phi_i_values = [8, 10, 15, 20] 
+
+    for i, phi_i_val in enumerate(plot_phi_i_values):
+        if phi_i_val in results_dict:
+            data = results_dict[phi_i_val]
+            ax.semilogx(a_common, data['w_de_a'], 
+                        label=fr"$\phi_i={phi_i_val}$", 
+                        color=colors[i % len(colors)], 
+                        ls=linestyles[i % len(linestyles)])
+    
+    ax.axhline(-1, color='gray', linestyle=':', lw=1, alpha=0.7)
+    ax.set_xlim([1e-4, 1])
+    ax.set_xlabel("a", fontsize=15)
+    ax.set_ylabel(r"$w_\phi$", fontsize=15)
+    ax.set_title("Scalar Field Equation of State $w_\phi$", fontsize=16)
+    ax.legend(fontsize=12)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_w_eff(results_dict: Dict[int, Dict[str, Any]], a_common: np.ndarray):
+    """Plots the effective equation of state (w_eff) for different phi_i values."""
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+    
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+
+    for i, phi_i_val in enumerate(sorted(results_dict.keys())):
+        data = results_dict[phi_i_val]
+        ax.semilogx(a_common, data['w_eff_a'], 
+                    label=fr"$\phi_i={phi_i_val}$", 
+                    color=colors[i % len(colors)], 
+                    ls=linestyles[i % len(linestyles)])
+        
+        # --- Phantom crossing detection and plotting ---
+        crossing_point = detect_phantom_crossing(a_common, data['w_eff_a'])
+        if crossing_point:
+            a_cross, z_cross = crossing_point
+            ax.plot(a_cross, -1, 'o', color=colors[i % len(colors)], markersize=8, zorder=5) # Mark the crossing
+            
+            # Annotate the crossing point
+            text_str = fr'$a={a_cross:.3f}$, $z={z_cross:.2f}$'
+            ax.annotate(text_str, 
+                        xy=(a_cross, -1), 
+                        xytext=(a_cross * 1.5, -1.2 + (0.1 * i)), # Adjust text position slightly for multiple lines
+                        arrowprops=dict(facecolor='black', shrink=0.05, width=0.5, headwidth=5),
+                        fontsize=10, 
+                        color=colors[i % len(colors)],
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=colors[i % len(colors)], lw=0.5, alpha=0.8)
+                       )
+            logging.info(f"Phantom crossing detected for phi_i={phi_i_val}: a={a_cross:.6f}, z={z_cross:.6f}")
+        else:
+            logging.info(f"No phantom crossing detected for phi_i={phi_i_val} within the plot range.")
+
+
+    ax.axhline(-1, color='gray', linestyle=':', lw=1, alpha=0.7)
+    ax.set_xlim([1e-4, 1])
+    ax.set_ylim([-1.5, 1.5]) # Set y-axis limits as requested
+    ax.set_xlabel("a", fontsize=15)
+    ax.set_ylabel(r"$w_\mathrm{eff}$", fontsize=15)
+    ax.set_title("Effective Equation of State $w_\mathrm{eff}$", fontsize=16)
+    ax.legend(fontsize=12)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_w_eff_coupling_term(results_dict: Dict[int, Dict[str, Any]], a_common: np.ndarray):
+    """Plots the critical part of the effective equation of state (the coupling term)."""
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+    
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+
+    for i, phi_i_val in enumerate(sorted(results_dict.keys())):
+        data = results_dict[phi_i_val]
+        ax.semilogx(a_common, data['w_eff_coupling_term_a'], 
+                    label=fr"$\phi_i={phi_i_val}$", 
+                    color=colors[i % len(colors)], 
+                    ls=linestyles[i % len(linestyles)])
+        
+    ax.set_xlim([1e-4, 1])
+    # Adjust y-axis limits as needed based on expected values for this term
+    ax.set_ylim([-0.5, 0.5]) 
+    ax.set_xlabel("a", fontsize=15)
+    ax.set_ylabel(r"$\frac{\phi'}{3H\phi} \frac{\rho_\chi}{\rho_\phi}$", fontsize=18)
+    ax.set_title("Effective Equation of State Coupling Term", fontsize=16)
+    ax.legend(fontsize=12)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_energy_ratios_and_delta_H(
+    results_dict: Dict[int, Dict[str, Any]], 
+    a_common: np.ndarray, 
+    rho_de_a_lcdm: np.ndarray, 
+    H_lcdm: np.ndarray
+):
+    """
+    Plots the ratio of dark energy density to LCDM dark energy density
+    and the percentage difference in Hubble parameter from LCDM.
+    """
+    fig, axs = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(8, 10))
+
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+    
+    # Values of phi_i to plot based on original code's plotting for these quantities
+    plot_phi_i = [8, 10, 15, 20] 
+
+    for i, phi_i_val in enumerate(plot_phi_i):
+        if phi_i_val in results_dict:
+            data = results_dict[phi_i_val]
+            rho_de_a = data['rho_de_a']
+            rho_tot_a = data['rho_tot_a']
+            H_model = a_common * np.sqrt(rho_tot_a / 3) # Calculate H for the current model
+
+            axs[0].loglog(a_common, rho_de_a / rho_de_a_lcdm, 
+                          color=colors[i % len(colors)], 
+                          ls=linestyles[i % len(linestyles)], 
+                          lw=2, label=fr"$\phi_i={phi_i_val}$")
+            
+            axs[1].semilogx(a_common, 100 * (H_model - H_lcdm) / H_lcdm, 
+                            color=colors[i % len(colors)], 
+                            ls=linestyles[i % len(linestyles)], 
+                            lw=2, label=fr"$\phi_i={phi_i_val}$")
+        
+    axs[0].set_xlim([1e-4, 1])
+    axs[0].set_ylim([1, 1e10])
+    axs[0].set_ylabel(r"$\rho_\phi/\rho_\Lambda$", fontsize=15)
+    axs[0].grid(True)
+    axs[0].legend(fontsize=12, loc='upper left')
+
+    axs[1].set_xlabel("a", fontsize=15)
+    axs[1].set_ylabel(r"$\Delta \mathcal{H}/\mathcal{H}$ [%]", fontsize=15)
+    axs[1].set_ylim([0, 10])
+    axs[1].grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+def plot_density_fractions(
+    results_dict: Dict[int, Dict[str, Any]], 
+    a_common: np.ndarray, 
+    rho_r_a: np.ndarray, 
+    rho_b_a: np.ndarray, 
+    rho_dm_a_lcdm: np.ndarray, 
+    rho_de_a_lcdm: np.ndarray, 
+    rho_tot_a_lcdm: np.ndarray
+):
+    """Plots the energy density fractions (Omega) for different components."""
+    plt.figure(figsize=(12, 9))
+
+    # Calculate fractions for phi_i = 8 and 10, as in the original code
+    data_8 = results_dict.get(8)
+    data_10 = results_dict.get(10)
+
+    # Calculate LCDM fractions
+    f_dm_a_lcdm_frac = rho_dm_a_lcdm / rho_tot_a_lcdm
+    f_de_a_lcdm_frac = rho_de_a_lcdm / rho_tot_a_lcdm
+    f_b_a_lcdm_frac = rho_b_a / rho_tot_a_lcdm
+    f_r_a_lcdm_frac = rho_r_a / rho_tot_a_lcdm
+
+    # Plot Dark Matter fractions
+    if data_8:
+        f_dm_a_8 = data_8['rho_dm_a'] / data_8['rho_tot_a']
+        plt.semilogx(a_common, f_dm_a_8, color='tab:green', ls='-.', lw=3, label=r"$\Omega_\chi (\phi_i=8)$")
+    if data_10:
+        f_dm_a_10 = data_10['rho_dm_a'] / data_10['rho_tot_a']
+        plt.semilogx(a_common, f_dm_a_10, color='tab:green', ls='-', lw=2, label=r"$\Omega_\chi (\phi_i=10)$")
+    plt.semilogx(a_common, f_dm_a_lcdm_frac, color='tab:green', ls='-', lw=1, label=r"$\Omega_\chi (\Lambda \mathrm{CDM})$")
+
+    # Plot Dark Energy (Scalar Field) fractions
+    if data_8:
+        f_de_a_8 = data_8['rho_de_a'] / data_8['rho_tot_a']
+        plt.semilogx(a_common, f_de_a_8, color='tab:red', ls=':', lw=3, label=r"$\Omega_\phi (\phi_i=8)$")
+    if data_10:
+        f_de_a_10 = data_10['rho_de_a'] / data_10['rho_tot_a']
+        plt.semilogx(a_common, f_de_a_10, color='tab:red', ls='-', lw=2, label=r"$\Omega_\phi (\phi_i=10)$")
+    plt.semilogx(a_common, f_de_a_lcdm_frac, color='tab:red', ls='-', lw=1, label=r"$\Omega_\Lambda (\Lambda \mathrm{CDM})$")
+
+    # Plot Baryon fractions
+    if data_8:
+        f_b_a_8 = rho_b_a / data_8['rho_tot_a']
+        plt.semilogx(a_common, f_b_a_8, color='tab:purple', ls='--', lw=3, label=r"$\Omega_\mathrm{b} (\phi_i=8)$")
+    if data_10:
+        f_b_a_10 = rho_b_a / data_10['rho_tot_a']
+        plt.semilogx(a_common, f_b_a_10, color='tab:purple', ls='-', lw=2, label=r"$\Omega_\mathrm{b} (\phi_i=10)$")
+    plt.semilogx(a_common, f_b_a_lcdm_frac, color='tab:purple', ls='-', lw=1, label=r"$\Omega_\mathrm{b} (\Lambda \mathrm{CDM})$")
+
+    # Plot Radiation fractions
+    if data_8:
+        f_r_a_8 = rho_r_a / data_8['rho_tot_a']
+        plt.semilogx(a_common, f_r_a_8, color='tab:blue', ls='-.', lw=3, label=r"$\Omega_\mathrm{r} (\phi_i=8)$")
+    if data_10:
+        f_r_a_10 = data_10['rho_r_a'] / data_10['rho_tot_a'] # Corrected: Use data_10['rho_r_a'] as it's passed from derived_data
+        plt.semilogx(a_common, f_r_a_10, color='tab:blue', ls='-', lw=2, label=r"$\Omega_\mathrm{r} (\phi_i=10)$")
+    plt.semilogx(a_common, f_r_a_lcdm_frac, color='tab:blue', ls='-', lw=1, label=r"$\Omega_\mathrm{r} (\Lambda \mathrm{CDM})$")
+    
+    plt.xlim([1e-4, 1])
+    plt.ylim([0, 0.9])
+
+    plt.xlabel("a", fontsize=25)
+    plt.ylabel(r"$\Omega$", fontsize=25)
+    plt.tick_params(axis="both", which="both", direction="in", length=10, width=3)
+    plt.yticks([0.2 * i for i in range(5)], fontsize=25)
+    plt.xticks(fontsize=25)
+
+    plt.grid(True)
+    plt.legend(fontsize=12, loc='center right', ncol=2)
+    plt.tight_layout()
+    plt.show()
+
+def plot_phi_ratio(results_dict: Dict[int, Dict[str, Any]], a_common: np.ndarray):
+    """Plots the scalar field (phi) normalized by its initial value (phi_i)."""
+    plt.figure(figsize=(12, 9))
+    ax = plt.gca()
+
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+
+    for i, phi_i_val in enumerate(sorted(results_dict.keys())):
+        data = results_dict[phi_i_val]
+        ax.semilogx(a_common, data['phi_a'] / phi_i_val, 
+                    label=fr'$\phi_i = {phi_i_val}$',
+                    color=colors[i % len(colors)], 
+                    ls=linestyles[i % len(linestyles)])
+    
+    plt.xlabel("a", fontsize=20)
+    plt.ylabel(r"$\phi/\phi_i$", fontsize=20)
+    plt.xlim([1e-6, 1])
+    plt.legend(fontsize=20)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_phi_prime(results_dict: Dict[int, Dict[str, Any]], a_common: np.ndarray):
+    """Plots the scalar field's velocity (phi_prime) for different phi_i values."""
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+    linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
+
+    # Get the initial phi_prime from the first simulation (they are all the same in this run)
+    initial_phi_prime = list(results_dict.values())[0]['result'][0][1]
+    
+    for i, phi_i_val in enumerate(sorted(results_dict.keys())):
+        data = results_dict[phi_i_val]
+        ax.loglog(a_common, np.abs(data['phi_prime_a'])/initial_phi_prime, 
+                    label=fr'$\phi_i = {phi_i_val}$',
+                    color=colors[i % len(colors)], 
+                    ls=linestyles[i % len(linestyles)])
+    
+    ax.set_xlabel("a", fontsize=15)
+    ax.set_ylabel(r"$|\phi'|/\phi_i '$", fontsize=15)
+    ax.set_title(f"Scalar Field Conformal Velocity (Initial $\phi'_i = {initial_phi_prime}$)", fontsize=16)
+    ax.set_xlim([a_common.min(), a_common.max()])
+    ax.legend(fontsize=12)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# --- Main execution block ---
+if __name__ == "__main__":
+    a_ini = 1e-14 
+    a_end = 1
+    n_steps = 10_000
+
+    # Define initial velocity and V0 guesses here, making them controllable
+    phi_initial_velocity = 2.5e25 # [GeV^2 ?] 2.5e25 is the value required to get PC at z=1.5 for a_in=1e-14
+    v0_initial_guess_1 = 1.15 * rho_cr * omega_de 
+    v0_initial_guess_2 = 0.9 * rho_cr * omega_de  
+
+    phi_i_values = [10] 
+    results_dict = {}
+
+    # Run simulations for each phi_i
+    for phi_i_val in phi_i_values:
+        # Pass the new parameters to solve_system
+        a_current, result_current, V0_current, rho_dm_i_current = solve_system(
+            ic_phi=phi_i_val, 
+            ic_phi_prime=phi_initial_velocity, 
+            a_ini=a_ini, 
+            a_end=a_end, 
+            n_steps=n_steps,
+            V0_guess_1=v0_initial_guess_1,
+            V0_guess_2=v0_initial_guess_2
+        )
+        
+        # Calculate derived quantities and store them
+        derived_data = calculate_derived_quantities(
+            a_current, result_current, V0_current, rho_dm_i_current, a_ini, phi_i_val
+        )
+        results_dict[phi_i_val] = {
+            'a': a_current,
+            'result': result_current, # phi, phi_prime
+            'V0': V0_current,
+            'rho_dm_i': rho_dm_i_current,
+            **derived_data # Unpack derived quantities directly
+        }
+
+    a_common = results_dict[phi_i_values[0]]['a']
+
+    # Calculate LCDM reference densities and Hubble parameter
+    rho_r_a_lcdm_ref = rho_cr * omega_r * a_common**(-4)
+    rho_b_a_lcdm_ref = rho_cr * omega_b * a_common**(-3)
+    rho_dm_a_lcdm_ref = rho_cr * omega_c * a_common**(-3)
+    rho_de_a_lcdm_ref = rho_cr * omega_de * np.ones_like(a_common)
+    
+    rho_tot_a_lcdm_ref = rho_r_a_lcdm_ref + rho_b_a_lcdm_ref + rho_dm_a_lcdm_ref + rho_de_a_lcdm_ref
+    H_lcdm_ref = a_common * np.sqrt(rho_tot_a_lcdm_ref / 3)
+
+    # --- Generate all plots ---
+    plot_w_eff(results_dict, a_common) 
+    plot_w_phi(results_dict, a_common) 
+    plot_w_eff_coupling_term(results_dict, a_common) # New plot
+    #plot_energy_ratios_and_delta_H(results_dict, a_common, rho_de_a_lcdm_ref, H_lcdm_ref) 
+    plot_density_fractions(
+        results_dict, a_common, rho_r_a_lcdm_ref, rho_b_a_lcdm_ref, 
+        rho_dm_a_lcdm_ref, rho_de_a_lcdm_ref, rho_tot_a_lcdm_ref
+    )
+    #plot_phi_ratio(results_dict, a_common) 
+    plot_phi_prime(results_dict, a_common)
