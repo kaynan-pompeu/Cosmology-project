@@ -1,0 +1,1104 @@
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import interp1d
+import logging
+from typing import List, Dict, Any, Tuple, Optional
+from scipy.integrate import odeint # Explicitly import odeint
+
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- Fixed cosmological parameters from Planck 2018 ---
+# --- Using CAMB units ---
+c_in_km_s = 299_792.458
+h = 0.6756
+H0 = 100*h/c_in_km_s
+rho_cr = 3*H0**2
+omega_c = 0.12/h**2
+omega_b = 0.022/h**2
+omega_phot = 2.47e-5/h**2
+omega_massless_nu = 3*(7/8)*(4/11)**(4/3)*omega_phot
+omega_r = omega_phot + omega_massless_nu
+omega_de = 1 - omega_c - omega_b - omega_r
+
+# --- Helper Functions (moved to top for explicit definition order) ---
+
+def find_critical_point(scale_factor_arr: np.ndarray, phi_prime_arr: np.ndarray) -> float:
+    """
+    Calculates the critical point for the scalar field derivative where it changes sign.
+    Returns 0.0 if no such crossing is found.
+    """
+    idx = np.where(np.diff(np.sign(phi_prime_arr)))[0]
+    if len(idx) > 0:
+        c = idx[0]
+        a_c = (scale_factor_arr[c] + scale_factor_arr[c+1]) / 2
+        return a_c
+    return 0.0
+
+def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[float, float]]:
+    """
+    Detects all instances where w_eff crosses the -1 line (phantom crossings).
+    Returns a list of (crossing_a, crossing_z) tuples.
+    """
+    crossings = []
+    # Look for a sign change from w_eff > -1 to w_eff < -1 OR w_eff < -1 to w_eff > -1
+    # We need to ensure w_eff is defined and not NaN
+    valid_indices = np.where(~np.isnan(w_eff))
+    a_valid = a[valid_indices]
+    w_eff_valid = w_eff[valid_indices]
+
+    for i in range(1, len(w_eff_valid)):
+        # Check for crossing -1 in either direction
+        if (w_eff_valid[i-1] > -1 and w_eff_valid[i] < -1) or \
+           (w_eff_valid[i-1] < -1 and w_eff_valid[i] > -1):
+            a1, a2 = a_valid[i-1], a_valid[i]
+            w1, w2 = w_eff_valid[i-1], w_eff_valid[i]
+
+            if (w2 - w1) != 0: # Avoid division by zero if w_eff is flat
+                crossing_a = a1 + (-1 - w1) * (a2 - a1) / (w2 - w1)
+                crossing_z = (1 / crossing_a) - 1
+                crossings.append((crossing_a, crossing_z))
+    return crossings
+
+# --- Core Equations of the Cosmological Model ---
+
+def H_curly(y: List[float], a: float, V0: float, rho_dm: float) -> float:
+    """Calculates the conformal Hubble parameter H*a for the given state."""
+    # y = [phi, phi_prime]
+    _, phi_prime = y
+    rho_phi = phi_prime**2 / (2 * a**2) + V0
+    rho = rho_cr * (omega_r * a**(-4) + omega_b * a**(-3)) + rho_dm + rho_phi
+    return a * np.sqrt(rho / 3)
+
+def equations(y: List[float], a: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations for the scalar field (phi, phi_prime).
+    Includes coupling of dark matter density to the scalar field.
+    """
+    phi, phi_prime = y
+    # Dark matter density coupled to the scalar field
+    rho_dm = rho_dm_i * (phi / phi_i) * (a_i / a)**3
+    H = H_curly(y, a, V0, rho_dm)
+    
+    # Add a small epsilon to H and phi to prevent division by zero
+    epsilon_denom = 1e-30
+    H_safe = H if np.abs(H) > epsilon_denom else epsilon_denom
+    phi_safe = phi if np.abs(phi) > epsilon_denom else epsilon_denom
+
+    dphi = phi_prime / (a * H_safe)
+    dphi_prime = -2 * phi_prime / a - a * rho_dm / (phi_safe * H_safe) # Use phi_safe and H_safe
+    return np.array([dphi, dphi_prime])
+
+def equations_loga(y: List[float], loga: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations with respect to log(a).
+    Used for integration at very early times.
+    """
+    a = np.exp(loga)
+    derivs = equations(y, a, V0, rho_dm_i, a_i, phi_i)
+    return a * derivs
+
+def integrate_cosmo(ic: List[float], a_ini: float, a_end: float, n_steps: int, V0: float, rho_dm_i: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Integrates the cosmological equations using a hybrid model:
+    log-integration for early universe and normal integration for later times.
+    """
+    frac = 0.4  # Fraction of time-steps spent in log integration
+    a_threshold = 1e-3  # Scale factor to switch integration methods
+    phi_i = ic[0]
+
+    logging.debug(f"integrate_cosmo called with ic={ic}, a_ini={a_ini}, a_end={a_end}") # Debug print
+
+    n_steps_log = int(frac * n_steps)
+    # Ensure a_log has at least 2 points for logspace
+    if n_steps_log < 2:
+        n_steps_log = 2
+    a_log = np.logspace(np.log10(a_ini), np.log10(a_threshold), n_steps_log)
+    loga = np.log(a_log)
+    result_log = odeint(equations_loga, ic, loga, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    ic_normal_integration = result_log[-1]  # Initial conditions for normal integration
+    n_steps_normal = n_steps - n_steps_log
+    # Ensure a_normal has at least 2 points for linspace
+    if n_steps_normal < 2:
+        n_steps_normal = 2
+    a_normal = np.linspace(a_threshold, a_end, n_steps_normal)
+    result_normal = odeint(equations, ic_normal_integration, a_normal, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    return np.concatenate((a_log, a_normal)), np.concatenate((result_log, result_normal))
+
+def find_fracs_de_dm_0(result: np.ndarray, V0: float, rho_dm_0: float) -> Tuple[float, float]:
+    """Calculates the dark energy and dark matter fractions at a=1 (present day)."""
+    _, phi_prime = result.T
+    rho_phi_0 = phi_prime[-1]**2 / 2 + V0
+
+    # Total density at a=1 (rho_r and rho_b are at a=1, so a**(-4) and a**(-3) become 1)
+    rho_tot_0 = rho_cr * (omega_r + omega_b) + rho_dm_0 + rho_phi_0
+
+    return rho_phi_0 / rho_tot_0, rho_dm_0 / rho_tot_0
+
+def solve_system(
+    ic_phi: float,
+    ic_phi_prime: float,
+    a_ini: float,
+    a_end: float,
+    n_steps: int,
+    V0_guess_1: float,
+    V0_guess_2: float
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """
+    Solves the cosmological system using a shooting method to find V0 that matches
+    the present-day dark energy density (omega_de).
+    """
+    logging.info("-----")
+    phi_i = ic_phi
+    logging.info(f"Begin shooting for phi_i = {phi_i}, phi_prime_i = {ic_phi_prime}")
+    logging.info(f"Target omega_de: {omega_de:.6f}; Target omega_c = {omega_c:.6f}")
+
+    # Initial conditions for odeint
+    ic = [ic_phi, ic_phi_prime]
+
+    # Initial guesses for shooting parameters 
+    V0_1 = V0_guess_1
+    V0_2 = V0_guess_2
+
+    # Initial guess for rho_dm_i assumes no (phi/phi_i) factor
+    rho_dm_i_guess = rho_cr * omega_c * a_ini**(-3)
+    rho_dm_i = rho_dm_i_guess
+
+    # Integrate KG with initial guesses
+    a, result_1 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_1, rho_dm_i)
+    _, result_2 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_2, rho_dm_i)
+
+    # Correct missing phi/phi_i factor for rho_dm_i (based on current phi_0)
+    # This recalculates rho_dm_i to ensure rho_dm(a=1) matches omega_c.
+    phi_0_1 = result_1.T[0][-1]
+    phi_0_2 = result_2.T[0][-1]
+    # Update rho_dm_i based on the first guess's phi_0 for consistency in the loop
+    rho_dm_i = rho_dm_i_guess * (phi_i / phi_0_1)
+
+    # Evaluate omega_c and omega_de for initial guesses at a=1
+    # rho_dm_0 is calculated at a=1, so (a_ini/a)**3 becomes (a_ini/1)**3
+    rho_dm_0_1 = rho_dm_i_guess * (phi_0_1 / phi_i) * (a_ini)**3 # Use rho_dm_i_guess for a consistent initial calculation
+    rho_dm_0_2 = rho_dm_i_guess * (phi_0_2 / phi_i) * (a_ini)**3
+
+    omega_de_1, omega_c_1 = find_fracs_de_dm_0(result_1, V0_1, rho_dm_0_1)
+    omega_de_2, omega_c_2 = find_fracs_de_dm_0(result_2, V0_2, rho_dm_0_2)
+
+    # Assess errors at initial guesses
+    error_dm_1 = (omega_c_1 - omega_c) / omega_c
+    error_dm_2 = (omega_c_2 - omega_c) / omega_c
+    error_de_1 = (omega_de_1 - omega_de) / omega_de
+    error_de_2 = (omega_de_2 - omega_de) / omega_de
+
+    logging.info(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f} (error = {error_de_1:.6f}); omega_c = {omega_c_1:.6f} (error = {error_dm_1:.6f})")
+    logging.info(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f} (error = {error_de_2:.6f}); omega_c = {omega_c_2:.6f} (error = {error_dm_2:.6f})")
+
+    # Check if initial guesses encapsulate the solution for omega_de
+    encapsulating = (omega_de_1 - omega_de) * (omega_de_2 - omega_de) < 0
+    if not encapsulating:
+        logging.warning("WARNING: initial guesses for V0 did not encapsulate the target omega_de")
+        logging.warning(f"Target omega_de: {omega_de}")
+        logging.warning(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f}")
+        logging.warning(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f}")
+
+    iters = 0
+    max_iters = 20
+    # Secant method iteration
+    while (iters < max_iters):
+        iters += 1
+
+        # Fit a line between (V0_1, omega_de_1) and (V0_2, omega_de_2)
+        # Handle cases where V0_2 - V0_1 is zero or very small to prevent division by zero
+        if abs(V0_2 - V0_1) < 1e-10: # A small epsilon to check for near-zero difference
+            logging.warning("V0_2 and V0_1 are too close. Adjusting V0_2 slightly for secant method.")
+            V0_2 += 1e-6 # Slightly perturb V0_2 to continue
+            # Recalculate omega_de_2
+            _, result_2_recalc = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_2, rho_dm_i)
+            phi_0_2_recalc = result_2_recalc.T[0][-1]
+            rho_dm_0_2_recalc = rho_dm_i_guess * (phi_0_2_recalc / phi_i) * (a_ini)**3
+            omega_de_2, _ = find_fracs_de_dm_0(result_2_recalc, V0_2, rho_dm_0_2_recalc)
+
+        a_line = (omega_de_2 - omega_de_1) / (V0_2 - V0_1)
+        b_line = omega_de_2 - a_line * V0_2
+
+        # Choose the point where the line would cross the target omega_de
+        # Handle cases where a_line is zero or very small
+        if abs(a_line) < 1e-10:
+            logging.warning("a_line is too close to zero. Secant method struggling. Breaking loop.")
+            break # Exit if secant method can't make progress
+
+        V0_try = (omega_de - b_line) / a_line
+
+        # Integrate KG assuming this new V0
+        _, result_try = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_try, rho_dm_i)
+        phi_0_try = result_try.T[0][-1]
+
+        # Evaluate omega_de and omega_c for new point
+        rho_dm_0_try = rho_dm_i_guess * (phi_0_try / phi_i) * (a_ini)**3 # Always use rho_dm_i_guess here
+        omega_de_try, omega_c_try = find_fracs_de_dm_0(result_try, V0_try, rho_dm_0_try)
+
+        # Assess errors at new point
+        error = (omega_de_try - omega_de) / omega_de
+        error_omega_c = (omega_c_try - omega_c) / omega_c
+        logging.info(f"V0 = {V0_try:.6f} => omega_de = {omega_de_try:.6f} (error = {error:.6f}); omega_c = {omega_c_try:.6f} (error = {error_omega_c:.6f})")
+
+        # Update rho_dm_i for next iteration based on the new phi_0
+        rho_dm_i = rho_dm_i_guess * (phi_i / result_try.T[0][-1])
+
+        # Exit condition
+        if abs(error) < 1e-4:
+            break
+
+        # Substitute one of the initial V0 guesses by the new V0 guess
+        # This maintains the bracketing if it was initially present,
+        # or updates the points for secant method otherwise.
+        if (omega_de_try > omega_de):
+            V0_1 = V0_try
+            omega_de_1 = omega_de_try
+        else:
+            V0_2 = V0_try
+            omega_de_2 = omega_de_try
+
+    if abs(error) > 1e-4: # Check if the loop exited due to max_iters
+        logging.warning(f"WARNING: reached max iterations in shooting with error = {error}")
+        raise RuntimeError(f"Shooting method failed to converge for phi_i={ic_phi}, phi_prime_i={ic_phi_prime}")
+    else:
+        logging.info(f"Finished shooting successfully after {iters} iterations")
+    return a, result_try, V0_try, rho_dm_i
+
+def calculate_derived_quantities(
+    a: np.ndarray,
+    result: np.ndarray,
+    V0: float,
+    rho_dm_i_for_case: float,
+    a_ini: float,
+    phi_initial_val_for_case: float
+) -> Dict[str, np.ndarray]:
+    """
+    Calculates various derived quantities (densities, equations of state)
+    from the integration results.
+    """
+    phi_a, phi_prime_a = result.T
+
+    # Calculate densities for the current model
+    rho_de_a = phi_prime_a**2 / (2 * a**2) + V0
+    rho_dm_a = rho_dm_i_for_case * (phi_a / phi_initial_val_for_case) * (a_ini / a)**3
+    rho_r_a = rho_cr * omega_r * a**(-4)
+    rho_b_a = rho_cr * omega_b * a**(-3)
+
+    rho_tot_a = rho_r_a + rho_b_a + rho_dm_a + rho_de_a
+
+    # Calculate equation of state for dark energy
+    # Add a small epsilon to rho_de_a to prevent division by zero
+    epsilon_denom = 1e-40
+    rho_de_a_safe = np.where(np.abs(rho_de_a) < epsilon_denom, epsilon_denom, rho_de_a)
+    w_de_a = (phi_prime_a**2 / (2 * a**2) - V0) / rho_de_a_safe
+
+    # Calculate H_curly (dimensionless Hubble parameter) for each a
+    # We need to calculate it using the values of phi_a and phi_prime_a at each step
+    H_curly_a = np.array([H_curly([phi_a[i], phi_prime_a[i]], a[i], V0, rho_dm_a[i]) for i in range(len(a))])
+
+    # Calculate effective equation of state using the provided expression
+    # w_eff = w_phi + (phi_prime / (3 * H_curly * phi)) * (rho_chi / rho_phi)
+    # Add a small epsilon to denominators to prevent division by zero for numerical stability
+    phi_a_safe = np.where(np.abs(phi_a) < epsilon_denom, epsilon_denom, phi_a)
+    H_curly_a_safe = np.where(np.abs(H_curly_a) < epsilon_denom, epsilon_denom, H_curly_a)
+    
+    # This is the coupling term for w_eff
+    coupling_term_a = (phi_prime_a / (3 * H_curly_a_safe * phi_a_safe)) * (rho_dm_a / rho_de_a_safe)
+    w_eff_a = w_de_a + coupling_term_a
+
+    # Calculate new quantity: phi_prime / (H * phi)
+    phi_prime_over_H_phi = phi_prime_a / (H_curly_a_safe * phi_a_safe)
+
+
+    return {
+        'phi_a': phi_a,
+        'phi_prime_a': phi_prime_a,
+        'rho_de_a': rho_de_a,
+        'rho_dm_a': rho_dm_a,
+        'w_de_a': w_de_a,
+        'rho_tot_a': rho_tot_a,
+        'w_eff_a': w_eff_a,
+        'rho_r_a': rho_r_a,
+        'rho_b_a': rho_b_a,
+        'H_curly_a': H_curly_a, # Also store H_curly for completeness
+        'w_eff_coupling_term_a': coupling_term_a, # Store the new term
+        'phi_prime_over_H_phi': phi_prime_over_H_phi # New quantity
+    }
+
+
+# --- Plotting Functions ---
+# Note: The original plot_w_and_coupling_terms, plot_energy_ratios_and_delta_H, plot_density_fractions,
+# and plot_phi_and_phi_prime functions are commented out as their functionality is being integrated
+# into the combined 2x3 plot structure within main().
+
+def plot_cosmology_dynamics(
+    scale_factor_arr: np.ndarray,
+    results_data: Dict[str, Any],
+    alpha_val: float,
+    phi_i_val: float,
+    phi_prime_i_val: float,
+    color: str,
+    ax1: plt.Axes, # Axis for w
+    ax2: plt.Axes, # Axis for phi/phi_i
+    ax3: plt.Axes, # Axis for phi'/phi'_i
+    ax4: plt.Axes  # New axis for phi'/(H*phi)
+):
+    """Plots the equation of state, scalar field, scalar field velocity, and new ratio."""
+    H = results_data['H_curly_a'] # Use H_curly_a from derived quantities
+    w_de = results_data['w_de_a']
+    rho_de = results_data['rho_de_a']
+    rho_cdm = results_data['rho_dm_a'] # Use rho_dm_a for dark matter
+    phi = results_data['phi_a']
+    phi_prime = results_data['phi_prime_a']
+    w_eff = results_data['w_eff_a'] # Use pre-calculated w_eff_a
+    phi_prime_over_H_phi = results_data['phi_prime_over_H_phi'] # New quantity
+
+    # Critical point for phi_prime
+    a_c = find_critical_point(scale_factor_arr, phi_prime)
+    logging.info(f'a_critical = {a_c:.5e}')
+
+    # Phantom crossings
+    phantom_crossings_z = find_all_phantom_crossings(scale_factor_arr, w_eff) # Use find_all_phantom_crossings
+    if phantom_crossings_z:
+        logging.info(f"Phantom crossings at redshifts (z): {[z for a, z in phantom_crossings_z]}")
+    else:
+        logging.info("No phantom crossing found.")
+
+    # --- Plot EoS (ax1) ---
+    label = fr"$\alpha = {alpha_val}$"
+    ax1.semilogx(scale_factor_arr, w_de, ls='--', color=color)
+    ax1.semilogx(scale_factor_arr, w_eff, ls='-', color=color, label=label)
+    ax1.axhline(-1, color='grey', linestyle=':', lw=1, alpha=0.3) # Horizontal line for w=-1
+
+    # Annotate phantom crossing if found
+    if phantom_crossings_z:
+        # Take the first crossing for annotation on this specific plot
+        a_p, z_p = phantom_crossings_z[0] 
+        # Find w_eff value at a_p (or closest point)
+        w_p_idx = np.argmin(np.abs(scale_factor_arr - a_p))
+        w_p = w_eff[w_p_idx]
+
+        # Define radii for the circle annotation
+        log_a_p = np.log10(a_p)
+        radius_log_a = 0.1
+        radius_w = 0.05
+
+        theta = np.linspace(0, 2 * np.pi, 200)
+        circle_log_x = log_a_p + radius_log_a * np.cos(theta)
+        circle_x = 10**circle_log_x # Convert back to linear scale for plotting on semilogx
+        circle_y = w_p + radius_w * np.sin(theta)
+
+        ax1.plot(circle_x, circle_y, color='red', lw=2)
+
+        ax1.annotate(
+            f"$z \\approx {z_p:.2f}$\n$w \\approx {w_p:.2f}$",
+            xy=(a_p, w_p),
+            xytext=(a_p * 1.5, w_p + 0.5), # Adjust text position
+            arrowprops=dict(arrowstyle="->", color='black', lw=1),
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9),
+        )
+
+    # --- Plot phi (ax2) ---
+    ax2.semilogx(scale_factor_arr, phi / phi_i_val, color=color, label=label)
+
+    # --- Plot phi' (ax3) ---
+    ax3.loglog(scale_factor_arr, np.abs(phi_prime) / phi_prime_i_val, color=color, label=label)
+
+    # --- Plot phi' / (H*phi) (ax4) ---
+    ax4.semilogx(scale_factor_arr, phi_prime_over_H_phi, color=color, label=label)
+    ax4.set_ylabel(r"$\phi' / (H\phi)$", fontsize=12)
+    ax4.set_title(r"$\phi' / (H\phi)$ Evolution", fontsize=13)
+    ax4.grid(True, alpha=0.3)
+
+
+    # --- Add vertical lines and shading ---
+    if a_c > 0: # Only add if a critical point was found
+        for ax_elem in (ax1, ax2, ax3, ax4): # Include new ax4
+            ax_elem.axvline(x=a_c, color='gray', linestyle=':', linewidth=1)
+            ax_elem.axvspan(scale_factor_arr[0], a_c, color='blue', alpha=0.08)
+            ax_elem.axvspan(a_c, scale_factor_arr[-1], color='green', alpha=0.08)
+
+        # Add dynamic phase description (only for ax2, ax3, ax4)
+        log_a = np.log10(scale_factor_arr)
+        log_a_min = log_a.min()
+        log_a_max = log_a.max()
+        log_ac = np.log10(a_c)
+        dx = log_a_max - log_a_min
+
+        for ax_elem in (ax2, ax3, ax4): # Include new ax4
+            ax_elem.text(
+                10**(log_ac - 0.35 * dx), 0.05, "Field climbing up",
+                transform=ax_elem.get_xaxis_transform(),
+                fontsize=12, color='blue',
+                verticalalignment='bottom', horizontalalignment='left',
+                alpha=1
+            )
+            ax_elem.text(
+                10**(log_ac + 0.35 * dx), 0.05, "Slow-rolling down",
+                transform=ax_elem.get_xaxis_transform(),
+                fontsize=12, color='green',
+                verticalalignment='bottom', horizontalalignment='right',
+                alpha=1
+            )
+
+def plot_phantom_phase_analysis(
+    phis_prime_values: np.ndarray,
+    z_in_list: List[float],
+    z_out_list: List[float],
+    delta_z_list: List[float],
+    scale_factor_arr: np.ndarray,
+    w_de_for_plot: np.ndarray,
+    w_eff_for_plot: np.ndarray,
+    crossings_for_plot: List[Tuple[float, float]], # Changed to Tuple[float, float] for (a,z)
+    phi_prime_i_for_plot: float, # Added for clarity in plot title/label
+    ax_left: plt.Axes, # Axis for w_eff(a)
+    ax_right: plt.Axes # Axis for z_in, z_out, delta_z
+):
+    """Plots the equation of state with phantom crossings and phantom phase duration."""
+
+    # --- Left plot: w_eff(a) (ax_left) ---
+    ax_left.semilogx(scale_factor_arr, w_eff_for_plot, label=fr"$\phi'_i = {phi_prime_i_for_plot:.0e}$", color='darkblue')
+    ax_left.semilogx(scale_factor_arr, w_de_for_plot, label=r"$w_\phi$", color='green', ls='--')
+    ax_left.axhline(-1, color='gray', linestyle='--', lw=1)
+
+    if len(crossings_for_plot) == 2:
+        # Crossings are (a, z) tuples, extract z
+        z_in_plot, z_out_plot = crossings_for_plot[0][1], crossings_for_plot[1][1]
+        a_in = 1 / (z_in_plot + 1)
+        a_out = 1 / (z_out_plot + 1)
+        ax_left.plot(a_in, -1, 'ro', label=rf"$z_\mathrm{{in}} \approx {z_in_plot:.2f}$")
+        ax_left.plot(a_out, -1, 'go', label=rf"$z_\mathrm{{out}} \approx {z_out_plot:.2f}$")
+        delta_z_val = z_in_plot - z_out_plot
+        ax_left.text(0.01, -1.4, rf"$\Delta z = z_{{\mathrm{{in}}}} - z_{{\mathrm{{out}}}} \approx {delta_z_val:.2f}$", fontsize=10)
+
+    # --- Find and plot critical points of w_de ---
+    # Approximate derivative of w_de
+    w_de_diff = np.diff(w_de_for_plot)
+
+    # Find indices where the sign of the derivative changes
+    critical_indices_w_de = np.where(np.diff(np.sign(w_de_diff)))[0]
+
+    logging.info("\nCritical points of w_de curve:")
+    critical_points_found_and_plotted = 0 # Counter to ensure label is added only once
+    epsilon = 1e-4 # Tolerance for ignoring points near w_de = 1 or w_de = -1
+
+    for idx in critical_indices_w_de:
+        # Interpolate to find the exact critical point
+        # Take the average of the scale factors and w_de values around the sign change
+        a_crit = (scale_factor_arr[idx] + scale_factor_arr[idx+1]) / 2
+        w_de_crit = (w_de_for_plot[idx] + w_de_for_plot[idx+1]) / 2
+
+        # Check if w_de_crit is approximately 1 or -1
+        if not (np.isclose(w_de_crit, 1.0, atol=epsilon) or np.isclose(w_de_crit, -1.0, atol=epsilon)):
+            logging.info(f"   Critical point found: (a={a_crit:.4e}, w_de={w_de_crit:.4f})")
+
+            plot_label = r'Critical Points of $w_\phi$' if critical_points_found_and_plotted == 0 else '_nolegend_' # Fixed SyntaxWarning
+
+            # Plot the critical point
+            ax_left.plot(a_crit, w_de_crit, 'X', color='purple', markersize=8, label=plot_label)
+
+            # Draw a vertical line through the critical point
+            ax_left.axvline(x=a_crit, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
+            critical_points_found_and_plotted += 1
+        else:
+            logging.info(f"   Ignored critical point at (a={a_crit:.4e}, w_de={w_de_crit:.4f}) because w_de is ~1 or ~-1.")
+
+    if critical_points_found_and_plotted == 0:
+        logging.info("   No critical points for w_de found, or all were ignored near w_de = 1 or -1.")
+
+
+    ax_left.set_xlabel("Scale factor $a$", fontsize=12)
+    ax_left.set_ylabel(r"$w$", fontsize=12)
+    ax_left.set_title(r"Equation of State with Phantom Crossings", fontsize=13)
+    ax_left.set_ylim([-1.5, 1.2])
+    ax_left.grid(True, alpha=0.3)
+    ax_left.legend(fontsize=10)
+
+    # --- Right plot: z_in, z_out and ∆z (ax_right) ---
+    ax_right.plot(phis_prime_values, z_in_list, 'o-', label=r"$z_\mathrm{in}$", color='red')
+    ax_right.plot(phis_prime_values, z_out_list, 'o-', label=r"$z_\mathrm{out}$", color='green')
+    ax_right.plot(phis_prime_values, delta_z_list, 'o-', label=r"$\Delta z$", color='black')
+    ax_right.set_yscale('log')
+    ax_right.set_xlabel(r"Initial scalar speed $\phi'_i$ [Mpc$^1$]", fontsize=12) # Added units
+    ax_right.set_ylabel(r"Redshift", fontsize=12)
+    ax_right.set_title(r"Phantom Phase Duration", fontsize=13)
+    ax_right.grid(True, which='both', alpha=0.3)
+    ax_right.legend(fontsize=10)
+
+def phantom_intensity(
+    phi_i_values: np.ndarray,
+    phi_prime_i_values: np.ndarray,
+    a_ini: float,
+    a_end: float,
+    n_steps: int
+):
+    """
+    Analyzes the minimum and maximum w_eff values
+    across a range of initial scalar field amplitudes (phi_i) and velocities (phi_prime_i).
+    Plots these results and adds text annotations for the redshift of the minimum w_eff.
+    """
+    min_w_eff_data = {phi_i: [] for phi_i in phi_i_values}
+    max_w_eff_data = {phi_i: [] for phi_i in phi_i_values}
+    # New dictionary to store the redshift of the minimum w_eff for each point
+    min_w_eff_z_data = {phi_i: [] for phi_i in phi_i_values}
+
+    for i, phi_i_val in enumerate(phi_i_values):
+        logging.info(f"\n--- Analyzing for phi_i = {phi_i_val} ---")
+        for j, phi_p_val in enumerate(phi_prime_i_values):
+            logging.info(f"Processing phi'_i = {phi_p_val:.2e}")
+            try: 
+                a_loop, result_loop, V0_loop, rho_dm_i_loop = solve_system(
+                    ic_phi=phi_i_val,
+                    ic_phi_prime=phi_p_val,
+                    a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+                    V0_guess_1=1.15 * rho_cr * omega_de,
+                    V0_guess_2=0.9 * rho_cr * omega_de
+                )
+                derived_data_loop = calculate_derived_quantities(
+                    a_loop, result_loop, V0_loop, rho_dm_i_loop, a_ini, phi_i_val
+                )
+                w_eff_loop = derived_data_loop['w_eff_a']
+                
+                min_w = np.min(w_eff_loop)
+                max_w = np.max(w_eff_loop)
+                
+                # Find the index of the minimum w_eff to get the corresponding scale factor
+                min_w_index = np.argmin(w_eff_loop)
+                a_at_min_w = a_loop[min_w_index]
+                z_at_min_w = (1.0 / a_at_min_w) - 1.0
+
+                min_w_eff_data[phi_i_val].append(min_w)
+                max_w_eff_data[phi_i_val].append(max_w)
+                min_w_eff_z_data[phi_i_val].append(z_at_min_w)
+                
+            except RuntimeError as e:
+                logging.error(f"Simulation failed for phi_i={phi_i_val}, phi'_i={phi_p_val}: {e}")
+                min_w_eff_data[phi_i_val].append(np.nan)
+                max_w_eff_data[phi_i_val].append(np.nan)
+                min_w_eff_z_data[phi_i_val].append(np.nan)
+            except Exception as e:
+                logging.error(f"An unexpected error occurred for phi'_i={phi_p_val}: {e}")
+                min_w_eff_data[phi_i_val].append(np.nan)
+                max_w_eff_data[phi_i_val].append(np.nan)
+                min_w_eff_z_data[phi_i_val].append(np.nan)
+                
+    # --- Plotting the results ---
+    fig_intensity, (ax_min, ax_max) = plt.subplots(1, 2, figsize=(24, 7))
+    cmap = plt.get_cmap('viridis')
+    colors = [cmap(i) for i in np.linspace(0, 1, len(phi_i_values))]
+
+    # Plot for Minimum w_eff
+    ax_min.set_title(r"Minimum $w_\mathrm{eff}$ vs. Initial Speed", fontsize=14)
+    ax_min.set_xlabel(r"Initial scalar speed $\phi'_i$ [Mpc$^-1$]", fontsize=12)
+    ax_min.set_ylabel(r"Min($w_\mathrm{eff}$)", fontsize=12)
+    ax_min.axhline(-1, color='gray', linestyle='--', label=r"$w_\mathrm{eff} = -1$")
+    ax_min.axhline(1, color='gray', linestyle=':', label=r"$w_\mathrm{eff} = 1$")
+    ax_min.grid(True, which="both", linestyle=':', alpha=0.5)
+
+    # Plot for Maximum w_eff
+    ax_max.set_title(r"Maximum $w_\mathrm{eff}$ vs. Initial Speed", fontsize=14)
+    ax_max.set_xlabel(r"Initial scalar speed $\phi'_i$ [Mpc^-1$^2$]", fontsize=12)
+    ax_max.set_ylabel(r"Max($w_\mathrm{eff}$)", fontsize=12)
+    ax_max.axhline(-1, color='gray', linestyle='--', label=r"$w_\mathrm{eff} = -1$")
+    ax_max.axhline(1, color='gray', linestyle=':', label=r"$w_\mathrm{eff} = 1$")
+    ax_max.grid(True, which="both", linestyle=':', alpha=0.5)
+    
+    
+    # Iterate and plot the results for each phi_i
+    for i, phi_i_val in enumerate(phi_i_values):
+        color = colors[i]
+        label = fr"$\phi_i = {phi_i_val}$"
+        
+        ax_min.semilogx(phi_prime_i_values, min_w_eff_data[phi_i_val], 'o-', color=color, label=label)
+        ax_max.semilogx(phi_prime_i_values, max_w_eff_data[phi_i_val], 'o-', color=color, label=label)
+        
+        # Add the redshift text annotation for each point on the min_w_eff plot
+        for j in range(len(phi_prime_i_values)):
+            phi_p_val = phi_prime_i_values[j]
+            min_w = min_w_eff_data[phi_i_val][j]
+            z_at_min_w = min_w_eff_z_data[phi_i_val][j]
+            print(f"phi_i={phi_i_val}, phi'_i={phi_p_val}, min_w={min_w}, z_at_min_w={z_at_min_w}")
+
+            if not np.isnan(min_w) and not np.isnan(z_at_min_w):
+                # We need to adjust the text position slightly so it doesn't overlap with the marker
+                text_x_pos = phi_p_val
+                text_y_pos = min_w + 0.05
+                ax_min.text(
+                    text_x_pos, text_y_pos,
+                    f"z={z_at_min_w:.2f}",
+                    fontsize=8,
+                    color=color,
+                    ha='center', va='bottom'
+                )
+
+    ax_min.legend()
+    ax_max.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+def w_eff_vs_epsilon_and_ratio(
+    a_loop: np.ndarray,
+    derived_data_loop: dict,
+    phi_i_val: float
+):
+    """
+    Plots the effective equation of state (w_eff) as a function of both
+    epsilon = phi'/(H*phi) and the dark matter to dark energy density ratio.
+
+    Args:
+        a_loop (np.ndarray): The array of scale factors.
+        derived_data_loop (dict): A dictionary containing derived cosmological data.
+        phi_i_val (float): The initial scalar field amplitude, used for the plot title.
+    """
+    # Extract the necessary data from the dictionary
+    w_eff_a = derived_data_loop['w_eff_a']
+    phi_prime_over_H_phi = derived_data_loop['phi_prime_over_H_phi']
+    rho_dm_a = derived_data_loop['rho_dm_a']
+    rho_de_a = derived_data_loop['rho_de_a']
+
+    # Calculate the ratio, handling potential division by zero
+    epsilon_denom = 1e-40 # Use a small number to avoid division by zero
+    rho_de_a_safe = np.where(np.abs(rho_de_a) < epsilon_denom, epsilon_denom, rho_de_a)
+    rho_dm_over_rho_de = rho_dm_a / rho_de_a_safe
+
+    # Create a figure with two subplots side-by-side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # --- Plot w_eff vs. Epsilon ---
+    ax1.set_title(r"Effective EoS $w_\mathrm{eff}$ vs. $\epsilon = \phi' / (H\phi)$", fontsize=14)
+    ax1.set_xlabel(r"$\epsilon = \phi' / (H\phi)$", fontsize=12)
+    ax1.set_ylabel(r"$w_\mathrm{eff}$", fontsize=12)
+    ax1.plot(phi_prime_over_H_phi, w_eff_a, label='Evolution')
+    ax1.axhline(-1, color='gray', linestyle='--', label=r"$w_\mathrm{eff} = -1$")
+    ax1.axhline(1, color='gray', linestyle=':', label=r"$w_\mathrm{eff} = 1$")
+    ax1.grid(True, which="both", linestyle=':', alpha=0.5)
+    ax1.legend()
+
+    # --- Plot w_eff vs. Density Ratio ---
+    ax2.set_title(r"Effective EoS $w_\mathrm{eff}$ vs. $\rho_\mathrm{dm} / \rho_\mathrm{de}$", fontsize=14)
+    ax2.set_xlabel(r"$\rho_\mathrm{dm} / \rho_\mathrm{de}$", fontsize=12)
+    ax2.set_ylabel(r"$w_\mathrm{eff}$", fontsize=12)
+    ax2.semilogx(rho_dm_over_rho_de, w_eff_a, label='Evolution')
+    ax2.axhline(-1, color='gray', linestyle='--', label=r"$w_\mathrm{eff} = -1$")
+    ax2.axhline(1, color='gray', linestyle=':', label=r"$w_\mathrm{eff} = 1$")
+    ax2.grid(True, which="both", linestyle=':', alpha=0.5)
+    ax2.legend()
+    
+    fig.suptitle(f"Analysis for $\phi_i = {phi_i_val}$", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to make space for the suptitle
+
+def background_paper_figs(a, results_dict, lcdm_data, cosmological_params, a_ini):
+    """
+    Generates a series of cosmological plots based on the provided simulation results.
+
+    Args:
+        a (np.ndarray): Array of scale factors.
+        results_dict (dict): Dictionary where keys are phi_i values and values
+                             are dictionaries containing 'result', 'V0', and 'rho_dm_i'.
+                             E.g., {8: {'result': result_8, 'V0': V0_8, 'rho_dm_i': rho_dm_i_8}, ...}
+        lcdm_data (dict): Dictionary with LCDM data, including 'rho_dm_a_lcdm', 'rho_de_a_lcdm'.
+        cosmological_params (dict): Dictionary containing cosmological parameters like
+                                    'rho_cr', 'omega_r', 'omega_b', etc.
+        a_ini (float): Initial scale factor.
+    """
+    # Extract cosmological parameters and LCDM data
+    rho_cr = cosmological_params['rho_cr']
+    omega_r = cosmological_params['omega_r']
+    omega_b = cosmological_params['omega_b']
+    rho_dm_a_lcdm = lcdm_data['rho_dm_a_lcdm']
+    rho_de_a_lcdm = lcdm_data['rho_de_a_lcdm']
+
+    # Dictionaries to store calculated values for each phi_i case
+    w_de_data = {}
+    rho_de_data = {}
+    rho_dm_data = {}
+    rho_tot_data = {}
+    H_data = {}
+    phi_data = {}
+
+    # Calculate densities for each case
+    rho_r_a = rho_cr * omega_r * a**(-4)
+    rho_b_a = rho_cr * omega_b * a**(-3)
+
+    for phi_i, data in results_dict.items():
+        result = data['result']
+        V0 = data['V0']
+        rho_dm_i = data['rho_dm_i']
+
+        phi_a, phi_prime_a = result.T
+        
+        # Calculate derived quantities
+        rho_de_a = phi_prime_a**2 / (2 * a**2) + V0
+        rho_dm_a = rho_dm_i * (phi_a / phi_i) * (a_ini / a)**3
+        
+        # Store for plotting
+        rho_de_data[phi_i] = rho_de_a
+        rho_dm_data[phi_i] = rho_dm_a
+        phi_data[phi_i] = phi_a
+
+        # Handle potential division by zero for w_de calculation
+        rho_de_a_safe = np.where(rho_de_a == 0, 1e-40, rho_de_a)
+        w_de_a = (phi_prime_a**2 / (2 * a**2) - V0) / rho_de_a_safe
+        w_de_data[phi_i] = w_de_a
+        
+        # Calculate total density and Hubble parameter
+        rho_tot_a = rho_r_a + rho_b_a + rho_dm_a + rho_de_a
+        rho_tot_data[phi_i] = rho_tot_a
+        H_data[phi_i] = a * np.sqrt(rho_tot_a / 3)
+
+    # --- Plot 1: Equation of State w_phi vs. a ---
+    plt.figure(figsize=(10, 8))
+    plt.semilogx(a, w_de_data[8], label=r"$\phi_i=8$")
+    plt.semilogx(a, w_de_data[10], label=r"$\phi_i=10$")
+    plt.semilogx(a, w_de_data[15], label=r"$\phi_i=15$")
+    plt.semilogx(a, w_de_data[20], label=r"$\phi_i=20$")
+    plt.xlim([1e-3, 1])
+    plt.xlabel("a")
+    plt.ylabel(r"$w_\phi$")
+    plt.legend()
+    plt.grid()
+
+    # --- Plot 2: Rho_de / Rho_Lambda and Delta H / H vs. a ---
+    rho_tot_a_lcdm = rho_r_a + rho_b_a + rho_dm_a_lcdm + rho_de_a_lcdm
+    H_lcdm = a * np.sqrt(rho_tot_a_lcdm / 3)
+    
+    fig, axs = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(10, 10))
+    axs[0].loglog(a, rho_de_data[8] / rho_de_a_lcdm, color='tab:red', ls='-', lw=2, label=r"$\phi_i=8$")
+    axs[0].loglog(a, rho_de_data[10] / rho_de_a_lcdm, color='tab:green', ls='--', lw=2, label=r"$\phi_i=10$")
+    axs[0].loglog(a, rho_de_data[15] / rho_de_a_lcdm, color='tab:purple', ls=':', lw=2, label=r"$\phi_i=15$")
+    axs[0].loglog(a, rho_de_data[20] / rho_de_a_lcdm, color='tab:blue', ls='-.', lw=2, label=r"$\phi_i=20$")
+    axs[0].set_xlim([1e-4, 1])
+    axs[0].set_ylim([1, 1e10])
+    axs[0].set_ylabel(r"$\rho_\phi/\rho_\Lambda$")
+    axs[0].grid()
+    axs[0].legend()
+
+    axs[1].semilogx(a, 100 * (H_data[8] - H_lcdm) / H_lcdm, color='tab:red', ls='-', lw=2, label=r"$\phi_i=8$")
+    axs[1].semilogx(a, 100 * (H_data[10] - H_lcdm) / H_lcdm, color='tab:green', ls='--', lw=2, label=r"$\phi_i=10$")
+    axs[1].semilogx(a, 100 * (H_data[15] - H_lcdm) / H_lcdm, color='tab:purple', ls=':', lw=2, label=r"$\phi_i=15$")
+    axs[1].semilogx(a, 100 * (H_data[20] - H_lcdm) / H_lcdm, color='tab:blue', ls='-.', lw=2, label=r"$\phi_i=20$")
+    axs[1].set_ylim([0, 10])
+    axs[1].set_xlabel("a")
+    axs[1].set_ylabel(r"$\Delta \mathcal{H}/\mathcal{H}$ [%]")
+    axs[1].grid()
+    axs[1].legend()
+    plt.tight_layout()
+
+    # --- Plot 3: Density Fractions Omega vs. a ---
+    plt.figure(figsize=(12, 9))
+    
+    # Calculate fractions for different cases
+    phi_i_to_plot = [8, 10]
+    for phi_i in phi_i_to_plot:
+        rho_tot_a = rho_tot_data[phi_i]
+        f_dm_a = rho_dm_data[phi_i] / rho_tot_a
+        f_de_a = rho_de_data[phi_i] / rho_tot_a
+        f_b_a = rho_b_a / rho_tot_a
+        f_r_a = rho_r_a / rho_tot_a
+
+        ls_style = '-' if phi_i == 10 else ':'
+        lw_size = 2 if phi_i == 10 else 3
+        
+        plt.semilogx(a, f_dm_a, color='tab:green', ls=ls_style, lw=lw_size, label=f'$\\Omega_{{dm}} (\\phi_i={phi_i})$' if phi_i == 10 else '_nolegend_')
+        plt.semilogx(a, f_de_a, color='tab:red', ls=ls_style, lw=lw_size, label=f'$\\Omega_{{de}} (\\phi_i={phi_i})$' if phi_i == 10 else '_nolegend_')
+        plt.semilogx(a, f_b_a, color='tab:purple', ls=ls_style, lw=lw_size, label=f'$\\Omega_{{b}} (\\phi_i={phi_i})$' if phi_i == 10 else '_nolegend_')
+        plt.semilogx(a, f_r_a, color='tab:blue', ls=ls_style, lw=lw_size, label=f'$\\Omega_{{r}} (\\phi_i={phi_i})$' if phi_i == 10 else '_nolegend_')
+    
+    # Plot LCDM case for comparison
+    rho_tot_a_lcdm = rho_r_a + rho_b_a + rho_dm_a_lcdm + rho_de_a_lcdm
+    f_dm_a_lcdm = rho_dm_a_lcdm / rho_tot_a_lcdm
+    f_de_a_lcdm = rho_de_a_lcdm / rho_tot_a_lcdm
+    f_b_a_lcdm = rho_b_a / rho_tot_a_lcdm
+    f_r_a_lcdm = rho_r_a / rho_tot_a_lcdm
+    
+    plt.semilogx(a, f_dm_a_lcdm, color='black', ls='--', lw=1, label=r"$\Lambda$CDM")
+    plt.semilogx(a, f_de_a_lcdm, color='black', ls='--', lw=1, label='_nolegend_')
+    plt.semilogx(a, f_b_a_lcdm, color='black', ls='--', lw=1, label='_nolegend_')
+    plt.semilogx(a, f_r_a_lcdm, color='black', ls='--', lw=1, label='_nolegend_')
+    
+    plt.xlim([1e-4, 1])
+    plt.ylim([0, 0.9])
+    plt.xlabel("a", fontsize=15)
+    plt.ylabel(r"$\Omega$", fontsize=15)
+    plt.tick_params(axis="both", which="both", direction="in", length=6, width=1.5)
+    plt.yticks(np.arange(0, 1, 0.2), fontsize=15)
+    plt.xticks(fontsize=15)
+    plt.grid()
+    plt.legend(fontsize=12, ncol=2)
+    plt.tight_layout()
+
+    # --- Plot 4: phi / phi_i vs. a ---
+    plt.figure(figsize=(10, 8))
+    for phi_i, phi_a in phi_data.items():
+        plt.semilogx(a, phi_a / phi_i, label=fr'$\phi_i = {phi_i}$')
+    plt.xlabel("a", fontsize=15)
+    plt.ylabel(r"$\phi/\phi_i$", fontsize=15)
+    plt.xlim([1e-6, 1])
+    plt.legend(fontsize=15)
+    plt.grid()
+    plt.tight_layout()
+    
+    return ['w_phi_vs_a.png', 'rho_de_and_delta_H.png', 'density_fractions.png', 'phi_over_phi_i.png']
+
+def main():
+    """Main function to execute the cosmological simulations and plotting."""
+
+    # --- Simulation parameters ---
+    a_ini = 1e-7
+    a_end = 1
+    n_steps = 10_000 # Number of steps for odeint integration
+
+    #=========================================================
+    # Initial conditions
+    #=========================================================
+
+    phi_i_main = 10 # Main plot scalar field amplitude
+    phi_i_vals_to_plot = [8, phi_i_main, 15, 20]
+    phi_prime_i_main = 4.5e2 
+    alpha_main = 1
+
+    # --- Set up plot colors ---
+    cmap = plt.get_cmap('tab10')
+    colors = [cmap(i) for i in np.linspace(0, 1, 1)] # Only need one color
+
+    # --- Create a single 2x3 figure for all plots ---
+    fig, axs = plt.subplots(2, 3, figsize=(20, 12), sharex=False) # sharex=False to manage sharing manually
+
+    # --- Run simulation for main plot data (odeint based) ---
+    logging.info(f"Running simulation for phi_i={phi_i_main}, phi_prime_i={phi_prime_i_main} (Main Plot)...")
+    try:
+        a_main, result_main, V0_main, rho_dm_i_main = solve_system(
+            ic_phi=phi_i_main, ic_phi_prime=phi_prime_i_main,
+            a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+            V0_guess_1=1.15 * rho_cr * omega_de, V0_guess_2=0.9 * rho_cr * omega_de
+        )
+        background_data_main = calculate_derived_quantities(
+            a_main, result_main, V0_main, rho_dm_i_main, a_ini, phi_i_main
+        )
+    except RuntimeError as e:
+        logging.error(f"Main simulation failed: {e}. Exiting.")
+        return # Exit main if the primary simulation fails
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during main simulation: {e}. Exiting.")
+        return
+
+    # Calculate LCDM reference densities and Hubble parameter for single plots
+    rho_r_a_lcdm_ref = rho_cr * omega_r * a_main**(-4)
+    rho_b_a_lcdm_ref = rho_cr * omega_b * a_main**(-3)
+    rho_dm_a_lcdm_ref = rho_cr * omega_c * a_main**(-3)
+    rho_de_a_lcdm_ref = rho_cr * omega_de * np.ones_like(a_main)
+    rho_tot_a_lcdm_ref = rho_r_a_lcdm_ref + rho_b_a_lcdm_ref + rho_dm_a_lcdm_ref + rho_de_a_lcdm_ref
+    H_lcdm_ref = a_main * np.sqrt(rho_tot_a_lcdm_ref / 3)
+
+
+    # --- Plot Cosmology Dynamics (top row and first bottom-left plot) ---
+    plot_cosmology_dynamics(
+        a_main, background_data_main, alpha_main, phi_i_main, phi_prime_i_main,
+        colors[0], axs[0,0], axs[0,1], axs[0,2], axs[1,0] # Pass individual axes for 2x3 layout
+    )
+
+    #=========================================================
+    # Plot configurations for figure 1
+    #=========================================================
+
+    # --- Manually set x-scale for plots that depend on scale factor 'a' ---
+    # And share their x-axes with axs[0,0]
+    axs[0,0].set_xscale('log') # Set log scale for the master axis
+    
+    # Share the x-axis of axs[0,0] with all other 'a' dependent plots
+    # This is the correct way to share multiple axes with a single master axis
+    axs[0,1].sharex(axs[0,0])
+    axs[0,2].sharex(axs[0,0])
+    axs[1,0].sharex(axs[0,0])
+    axs[1,1].sharex(axs[0,0]) # The left plot of phantom phase analysis also depends on 'a'
+
+    # --- Axis formatting for axs[0,0] (w) ---
+    axs[0,0].set_ylabel(r"$w$", fontsize=12)
+    axs[0,0].set_ylim([-1.5, 1.5])
+    axs[0,0].set_title(r"Equation of State", fontsize=13)
+    axs[0,0].grid(True, alpha=0.3)
+    custom_lines = [
+        mpl.lines.Line2D([0], [0], color="black", lw=1, ls='-'),
+        mpl.lines.Line2D([0], [0], color="black", lw=1, ls='--'),
+    ]
+    axs[0,0].legend(handles=custom_lines, labels=[r"$w_\mathrm{eff}$", r"$w_\phi$"], loc="upper right", fontsize=10)
+
+    # --- Axis formatting for axs[0,1] (phi/phi_i) ---
+    axs[0,1].set_ylabel(r"$\phi / \phi_i$", fontsize=12)
+    axs[0,1].set_title(r"Scalar Field Evolution", fontsize=13)
+    axs[0,1].grid(True, alpha=0.3)
+
+    # --- Axis formatting for axs[0,2] (phi'/phi'_i) ---
+    axs[0,2].set_ylabel(r"$|\phi '| / \phi_i '$", fontsize=12)
+    axs[0,2].set_title(r"Scalar Field Velocity", fontsize=13)
+    axs[0,2].grid(True, alpha=0.3)
+
+    # --- Axis formatting for axs[1,0] (phi'/(H*phi)) ---
+    # Labels and title already set in plot_cosmology_dynamics for ax4
+    axs[1,0].grid(True, alpha=0.3)
+
+    # --- Add parameter box to axs[1,0] ---
+    param_text = (
+        r"$\phi_i = %.1f$" "\n"
+        r"$\phi'_i = %.0e$" "\n"
+        r"$\alpha = %.3f$"
+    ) % (phi_i_main, phi_prime_i_main, alpha_main)
+
+    axs[1,0].text(
+        0.83, 0.8, param_text,
+        transform=axs[1,0].transAxes,
+        fontsize=10,
+        verticalalignment='bottom',
+        bbox=dict(boxstyle="round,pad=0.4", edgecolor='black', facecolor='white', alpha=0.8)
+    )
+
+    #=========================================================
+    # End of plot configurations
+    #=========================================================
+
+    # --- Density Ratio Calculation at a target redshift ---
+    z_target = 1.5
+    a_target = 1 / (1 + z_target)
+
+    # Use interpolators from the main run's background_data
+    rho_cdm_interp = interp1d(a_main, background_data_main['rho_dm_a'], bounds_error=False, fill_value="extrapolate")
+    rho_de_interp = interp1d(a_main, background_data_main['rho_de_a'], bounds_error=False, fill_value="extrapolate")
+
+    rho_chi_val = rho_cdm_interp(a_target)
+    rho_de_val = rho_de_interp(a_target)
+
+    ratio = rho_chi_val / rho_de_val
+    logging.info(f"\nAt z = {z_target}, a = {a_target:.4f}")
+    logging.info(f"rho_chi / rho_de = {ratio:.5e}")
+
+    # --- Phantom Phase Duration Analysis (bottom-middle and bottom-right plots) ---
+    phis_prime_values = np.linspace(1e4, 1e5, 5)
+    z_in_list = []
+    z_out_list = []
+    delta_z_list = []
+
+    logging.info("\nAnalyzing phantom phase duration for varying initial scalar speeds...")
+    # --- Loop through each initial scalar speed value for parameter space analysis ---
+    for i, phi_p_val in enumerate(phis_prime_values):
+        logging.info(f"   Processing {i+1}/{len(phis_prime_values)}: phi'_i = {phi_p_val:.0f}")
+
+        try:
+            a_loop, result_loop, V0_loop, rho_dm_i_loop = solve_system(
+                ic_phi=phi_i_main, # Keep phi_i fixed for this scan
+                ic_phi_prime=phi_p_val,
+                a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+                V0_guess_1=1.15 * rho_cr * omega_de, V0_guess_2=0.9 * rho_cr * omega_de
+            )
+            derived_data_loop = calculate_derived_quantities(
+                a_loop, result_loop, V0_loop, rho_dm_i_loop, a_ini, phi_i_main
+            )
+
+            w_eff_loop = derived_data_loop['w_eff_a'] # Use pre-calculated w_eff_a
+            crossings = find_all_phantom_crossings(a_loop, w_eff_loop) # Use find_all_phantom_crossings
+
+            if len(crossings) == 2:
+                z_in, z_out = crossings[0][1], crossings[1][1] # Get z from (a,z) tuple
+            elif len(crossings) == 1:
+                z_in, z_out = crossings[0][1], np.nan
+            else:
+                z_in, z_out = np.nan, np.nan
+
+            z_in_list.append(z_in)
+            z_out_list.append(z_out)
+            delta_z_list.append(z_in - z_out if np.isfinite(z_in) and np.isfinite(z_out) else np.nan)
+        except RuntimeError as e:
+            logging.error(f"Simulation failed for phi'_i={phi_p_val}: {e}")
+            z_in_list.append(np.nan)
+            z_out_list.append(np.nan)
+            delta_z_list.append(np.nan)
+        except Exception as e:
+            logging.error(f"An unexpected error occurred for phi'_i={phi_p_val}: {e}")
+            z_in_list.append(np.nan)
+            z_out_list.append(np.nan)
+            delta_z_list.append(np.nan)
+
+
+    # w_eff for the left plot of the second figure comes from the main run
+    w_de_for_plot = background_data_main['w_de_a']
+    w_eff_for_plot_main_run = background_data_main['w_eff_a'] # Use pre-calculated w_eff_a
+
+    crossings_for_plot_main_run = find_all_phantom_crossings(a_main, w_eff_for_plot_main_run)
+
+    plot_phantom_phase_analysis(
+        phis_prime_values, z_in_list, z_out_list, delta_z_list,
+        a_main, w_de_for_plot, w_eff_for_plot_main_run, crossings_for_plot_main_run, phi_prime_i_main,
+        axs[1,1], axs[1,2] # Pass individual axes for phantom phase analysis in 2x3 layout
+    )
+
+    axs[1,0].set_xlabel("Scale factor $a$", fontsize=12)
+    axs[1,1].set_xlabel("Scale factor $a$", fontsize=12)
+    axs[1,2].set_xlabel(r"Initial scalar speed $\phi'_i$ [Mpc$^{-1}$]", fontsize=12)
+
+    '''phi_i_values = np.array([2, 5, 10, 20])
+    phi_prime_i_values = np.logspace(8, 12, 10)
+    
+    phantom_intensity(
+        phi_i_values, phi_prime_i_values, a_ini, a_end, n_steps
+    )
+
+    w_eff_vs_epsilon_and_ratio(a_main, background_data_main, phi_i_main)'''
+
+    plt.tight_layout()
+    plt.show()
+
+    #===========================================
+    # Figure 2: Background Paper Figures
+    #===========================================
+
+    results_dict = {}
+    
+    # --- Cosmological parameters needed for the plots ---
+    cosmological_params = {
+        'rho_cr': rho_cr,
+        'omega_r': omega_r,
+        'omega_b': omega_b,
+        'omega_c': omega_c,
+        'omega_de': omega_de
+    }
+
+    # --- Run simulations and store results ---
+    for phi_i in phi_i_vals_to_plot:
+        logging.info(f"Solving for phi_i = {phi_i}")
+        try:
+            a, result, V0, rho_dm_i = solve_system(
+                ic_phi=phi_i,
+                ic_phi_prime=phi_prime_i_main,
+                a_ini=a_ini,
+                a_end=a_end,
+                n_steps=n_steps,
+                V0_guess_1=1.15 * rho_cr * omega_de,
+                V0_guess_2=0.9 * rho_cr * omega_de
+            )
+            results_dict[phi_i] = {'result': result, 'V0': V0, 'rho_dm_i': rho_dm_i}
+        except RuntimeError as e:
+            logging.error(f"Failed to converge for phi_i = {phi_i}: {e}")
+    
+    # --- Prepare LCDM data for comparison ---
+    # Assuming 'a' and 'n_steps' are consistent from the last successful simulation
+    rho_r_a = cosmological_params['rho_cr'] * cosmological_params['omega_r'] * a**(-4)
+    rho_b_a = cosmological_params['rho_cr'] * cosmological_params['omega_b'] * a**(-3)
+    rho_dm_a_lcdm = cosmological_params['rho_cr'] * cosmological_params['omega_c'] * a**(-3)
+    rho_de_a_lcdm = cosmological_params['rho_cr'] * cosmological_params['omega_de'] * np.ones_like(a)
+
+    lcdm_data = {
+        'rho_dm_a_lcdm': rho_dm_a_lcdm,
+        'rho_de_a_lcdm': rho_de_a_lcdm
+    }
+
+    background_paper_figs(a, results_dict, lcdm_data, cosmological_params, a_ini)
+
+    plt.show()
+
+if __name__ == "__main__":
+    main()
