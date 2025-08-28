@@ -1,0 +1,558 @@
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.integrate import odeint 
+import logging
+from typing import List, Dict, Any, Tuple, Optional
+
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- Fixed cosmological parameters from Planck 2018 ---
+# --- Using CAMB units ---
+c_in_km_s = 299_792.458
+h = 0.6756
+H0 = 100*h/c_in_km_s
+rho_cr = 3*H0**2
+omega_c = 0.12/h**2
+omega_b = 0.022/h**2
+omega_phot = 2.47e-5/h**2
+omega_massless_nu = 3*(7/8)*(4/11)**(4/3)*omega_phot
+omega_r = omega_phot + omega_massless_nu
+omega_de = 1 - omega_c - omega_b - omega_r
+# -- DESI central values ---
+w0_desi = -0.727
+wa = -1.05
+
+# --- Helper Functions (moved to top for explicit definition order) ---
+
+def find_critical_point(scale_factor_arr: np.ndarray, phi_prime_arr: np.ndarray) -> float:
+    """
+    Calculates the critical point for the scalar field derivative where it changes sign.
+    Returns 0.0 if no such crossing is found.
+    """
+    idx = np.where(np.diff(np.sign(phi_prime_arr)))[0]
+    if len(idx) > 0:
+        c = idx[0]
+        a_c = (scale_factor_arr[c] + scale_factor_arr[c+1]) / 2
+        return a_c
+    return 0.0
+
+def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[float, float]]:
+    """
+    Detects all instances where w_eff crosses the -1 line (phantom crossings).
+    Returns a list of (crossing_a, crossing_z) tuples.
+    """
+    crossings = []
+    # Look for a sign change from w_eff > -1 to w_eff < -1 OR w_eff < -1 to w_eff > -1
+    # We need to ensure w_eff is defined and not NaN
+    valid_indices = np.where(~np.isnan(w_eff))
+    a_valid = a[valid_indices]
+    w_eff_valid = w_eff[valid_indices]
+
+    for i in range(1, len(w_eff_valid)):
+        # Check for crossing -1 in either direction
+        if (w_eff_valid[i-1] > -1 and w_eff_valid[i] < -1) or \
+           (w_eff_valid[i-1] < -1 and w_eff_valid[i] > -1):
+            a1, a2 = a_valid[i-1], a_valid[i]
+            w1, w2 = w_eff_valid[i-1], w_eff_valid[i]
+
+            if (w2 - w1) != 0: # Avoid division by zero if w_eff is flat
+                crossing_a = a1 + (-1 - w1) * (a2 - a1) / (w2 - w1)
+                crossing_z = (1 / crossing_a) - 1
+                crossings.append((crossing_a, crossing_z))
+    return crossings
+
+#============================================================================
+# --- Core Functions for HDS analysis ---
+#============================================================================
+
+def H_curly(y: List[float], a: float, V0: float, rho_dm: float) -> float:
+    """Calculates the conformal Hubble parameter H*a for the given state."""
+    # y = [phi, phi_prime]
+    _, phi_prime = y
+    rho_phi = phi_prime**2 / (2 * a**2) + V0
+    rho = rho_cr * (omega_r * a**(-4) + omega_b * a**(-3)) + rho_dm + rho_phi
+    return a * np.sqrt(rho / 3)
+
+def equations(y: List[float], a: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations for the scalar field (phi, phi_prime).
+    Includes coupling of dark matter density to the scalar field.
+    """
+    phi, phi_prime = y
+    # Dark matter density coupled to the scalar field
+    rho_dm = rho_dm_i * (phi / phi_i) * (a_i / a)**3
+    H = H_curly(y, a, V0, rho_dm)
+    
+    # Add a small epsilon to H and phi to prevent division by zero
+    epsilon_denom = 1e-30
+    H_safe = H if np.abs(H) > epsilon_denom else epsilon_denom
+    phi_safe = phi if np.abs(phi) > epsilon_denom else epsilon_denom
+
+    dphi = phi_prime / (a * H_safe)
+    dphi_prime = -2 * phi_prime / a - a * rho_dm / (phi_safe * H_safe) # Use phi_safe and H_safe
+    return np.array([dphi, dphi_prime])
+
+def equations_loga(y: List[float], loga: float, V0: float, rho_dm_i: float, a_i: float, phi_i: float) -> List[float]:
+    """
+    Defines the system of differential equations with respect to log(a).
+    Used for integration at very early times.
+    """
+    a = np.exp(loga)
+    derivs = equations(y, a, V0, rho_dm_i, a_i, phi_i)
+    return a * derivs
+
+def integrate_cosmo(ic: List[float], a_ini: float, a_end: float, n_steps: int, V0: float, rho_dm_i: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Integrates the cosmological equations using a hybrid model:
+    log-integration for early universe and normal integration for later times.
+    """
+    frac = 0.4  # Fraction of time-steps spent in log integration
+    a_threshold = 1e-3  # Scale factor to switch integration methods
+    phi_i = ic[0]
+
+    logging.debug(f"integrate_cosmo called with ic={ic}, a_ini={a_ini}, a_end={a_end}") # Debug print
+
+    n_steps_log = int(frac * n_steps)
+    # Ensure a_log has at least 2 points for logspace
+    if n_steps_log < 2:
+        n_steps_log = 2
+    a_log = np.logspace(np.log10(a_ini), np.log10(a_threshold), n_steps_log)
+    loga = np.log(a_log)
+    result_log = odeint(equations_loga, ic, loga, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    ic_normal_integration = result_log[-1]  # Initial conditions for normal integration
+    n_steps_normal = n_steps - n_steps_log
+    # Ensure a_normal has at least 2 points for linspace
+    if n_steps_normal < 2:
+        n_steps_normal = 2
+    a_normal = np.linspace(a_threshold, a_end, n_steps_normal)
+    result_normal = odeint(equations, ic_normal_integration, a_normal, args=(V0, rho_dm_i, a_ini, phi_i))
+
+    return np.concatenate((a_log, a_normal)), np.concatenate((result_log, result_normal))
+
+def find_fracs_de_dm_0(result: np.ndarray, V0: float, rho_dm_0: float) -> Tuple[float, float]:
+    """Calculates the dark energy and dark matter fractions at a=1 (present day)."""
+    _, phi_prime = result.T
+    rho_phi_0 = phi_prime[-1]**2 / 2 + V0
+
+    # Total density at a=1 (rho_r and rho_b are at a=1, so a**(-4) and a**(-3) become 1)
+    rho_tot_0 = rho_cr * (omega_r + omega_b) + rho_dm_0 + rho_phi_0
+
+    return rho_phi_0 / rho_tot_0, rho_dm_0 / rho_tot_0
+
+def solve_system(
+    ic_phi: float,
+    ic_phi_prime: float,
+    a_ini: float,
+    a_end: float,
+    n_steps: int,
+    V0_guess_1: float,
+    V0_guess_2: float
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """
+    Solves the cosmological system using a shooting method to find V0 that matches
+    the present-day dark energy density (omega_de).
+    """
+    logging.info("-----")
+    phi_i = ic_phi
+    logging.info(f"Begin shooting for phi_i = {phi_i}, phi_prime_i = {ic_phi_prime}")
+    logging.info(f"Target omega_de: {omega_de:.6f}; Target omega_c = {omega_c:.6f}")
+
+    # Initial conditions for odeint
+    ic = [ic_phi, ic_phi_prime]
+
+    # Initial guesses for shooting parameters 
+    V0_1 = V0_guess_1
+    V0_2 = V0_guess_2
+
+    # Initial guess for rho_dm_i assumes no (phi/phi_i) factor
+    rho_dm_i_guess = rho_cr * omega_c * a_ini**(-3)
+    rho_dm_i = rho_dm_i_guess
+
+    # Integrate KG with initial guesses
+    a, result_1 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_1, rho_dm_i)
+    _, result_2 = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_2, rho_dm_i)
+
+    # Correct missing phi/phi_i factor for rho_dm_i (based on current phi_0)
+    # This recalculates rho_dm_i to ensure rho_dm(a=1) matches omega_c.
+    phi_0_1 = result_1.T[0][-1]
+    phi_0_2 = result_2.T[0][-1]
+    # Update rho_dm_i based on the first guess's phi_0 for consistency in the loop
+    rho_dm_i = rho_dm_i_guess * (phi_i / phi_0_1)
+
+    # Evaluate omega_c and omega_de for initial guesses at a=1
+    # rho_dm_0 is calculated at a=1, so (a_ini/a)**3 becomes (a_ini/1)**3
+    rho_dm_0_1 = rho_dm_i_guess * (phi_0_1 / phi_i) * (a_ini)**3 # Use rho_dm_i_guess for a consistent initial calculation
+    rho_dm_0_2 = rho_dm_i_guess * (phi_0_2 / phi_i) * (a_ini)**3
+
+    omega_de_1, omega_c_1 = find_fracs_de_dm_0(result_1, V0_1, rho_dm_0_1)
+    omega_de_2, omega_c_2 = find_fracs_de_dm_0(result_2, V0_2, rho_dm_0_2)
+
+    # Assess errors at initial guesses
+    error_dm_1 = (omega_c_1 - omega_c) / omega_c
+    error_dm_2 = (omega_c_2 - omega_c) / omega_c
+    error_de_1 = (omega_de_1 - omega_de) / omega_de
+    error_de_2 = (omega_de_2 - omega_de) / omega_de
+
+    logging.info(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f} (error = {error_de_1:.6f}); omega_c = {omega_c_1:.6f} (error = {error_dm_1:.6f})")
+    logging.info(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f} (error = {error_de_2:.6f}); omega_c = {omega_c_2:.6f} (error = {error_dm_2:.6f})")
+
+    # Check if initial guesses encapsulate the solution for omega_de
+    encapsulating = (omega_de_1 - omega_de) * (omega_de_2 - omega_de) < 0
+    if not encapsulating:
+        logging.warning("WARNING: initial guesses for V0 did not encapsulate the target omega_de")
+        logging.warning(f"Target omega_de: {omega_de}")
+        logging.warning(f"V0 = {V0_1:.6f} => omega_de = {omega_de_1:.6f}")
+        logging.warning(f"V0 = {V0_2:.6f} => omega_de = {omega_de_2:.6f}")
+
+    iters = 0
+    max_iters = 20
+    # Secant method iteration
+    while (iters < max_iters):
+        iters += 1
+
+        # Fit a line between (V0_1, omega_de_1) and (V0_2, omega_de_2)
+        # Handle cases where V0_2 - V0_1 is zero or very small to prevent division by zero
+        if abs(V0_2 - V0_1) < 1e-10: # A small epsilon to check for near-zero difference
+            logging.warning("V0_2 and V0_1 are too close. Adjusting V0_2 slightly for secant method.")
+            V0_2 += 1e-6 # Slightly perturb V0_2 to continue
+            # Recalculate omega_de_2
+            _, result_2_recalc = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_2, rho_dm_i)
+            phi_0_2_recalc = result_2_recalc.T[0][-1]
+            rho_dm_0_2_recalc = rho_dm_i_guess * (phi_0_2_recalc / phi_i) * (a_ini)**3
+            omega_de_2, _ = find_fracs_de_dm_0(result_2_recalc, V0_2, rho_dm_0_2_recalc)
+
+        a_line = (omega_de_2 - omega_de_1) / (V0_2 - V0_1)
+        b_line = omega_de_2 - a_line * V0_2
+
+        # Choose the point where the line would cross the target omega_de
+        # Handle cases where a_line is zero or very small
+        if abs(a_line) < 1e-10:
+            logging.warning("a_line is too close to zero. Secant method struggling. Breaking loop.")
+            break # Exit if secant method can't make progress
+
+        V0_try = (omega_de - b_line) / a_line
+
+        # Integrate KG assuming this new V0
+        _, result_try = integrate_cosmo(ic, a_ini, a_end, n_steps, V0_try, rho_dm_i)
+        phi_0_try = result_try.T[0][-1]
+
+        # Evaluate omega_de and omega_c for new point
+        rho_dm_0_try = rho_dm_i_guess * (phi_0_try / phi_i) * (a_ini)**3 # Always use rho_dm_i_guess here
+        omega_de_try, omega_c_try = find_fracs_de_dm_0(result_try, V0_try, rho_dm_0_try)
+
+        # Assess errors at new point
+        error = (omega_de_try - omega_de) / omega_de
+        error_omega_c = (omega_c_try - omega_c) / omega_c
+        logging.info(f"V0 = {V0_try:.6f} => omega_de = {omega_de_try:.6f} (error = {error:.6f}); omega_c = {omega_c_try:.6f} (error = {error_omega_c:.6f})")
+
+        # Update rho_dm_i for next iteration based on the new phi_0
+        rho_dm_i = rho_dm_i_guess * (phi_i / result_try.T[0][-1])
+
+        # Exit condition
+        if abs(error) < 1e-4:
+            break
+
+        # Substitute one of the initial V0 guesses by the new V0 guess
+        # This maintains the bracketing if it was initially present,
+        # or updates the points for secant method otherwise.
+        if (omega_de_try > omega_de):
+            V0_1 = V0_try
+            omega_de_1 = omega_de_try
+        else:
+            V0_2 = V0_try
+            omega_de_2 = omega_de_try
+
+    if abs(error) > 1e-4: # Check if the loop exited due to max_iters
+        logging.warning(f"WARNING: reached max iterations in shooting with error = {error}")
+        raise RuntimeError(f"Shooting method failed to converge for phi_i={ic_phi}, phi_prime_i={ic_phi_prime}")
+    else:
+        logging.info(f"Finished shooting successfully after {iters} iterations")
+    return a, result_try, V0_try, rho_dm_i
+
+def calculate_derived_quantities(
+    a: np.ndarray,
+    result: np.ndarray,
+    V0: float,
+    rho_dm_i_for_case: float,
+    a_ini: float,
+    phi_initial_val_for_case: float
+) -> Dict[str, np.ndarray]:
+    """
+    Calculates various derived quantities (densities, equations of state)
+    from the integration results.
+    """
+    phi_a, phi_prime_a = result.T
+
+    # Calculate densities for the current model
+    rho_de_a = phi_prime_a**2 / (2 * a**2) + V0
+    rho_dm_a = rho_dm_i_for_case * (phi_a / phi_initial_val_for_case) * (a_ini / a)**3
+    rho_r_a = rho_cr * omega_r * a**(-4)
+    rho_b_a = rho_cr * omega_b * a**(-3)
+
+    rho_tot_a = rho_r_a + rho_b_a + rho_dm_a + rho_de_a
+
+    # Calculate equation of state for dark energy
+    # Add a small epsilon to rho_de_a to prevent division by zero
+    epsilon_denom = 1e-40
+    rho_de_a_safe = np.where(np.abs(rho_de_a) < epsilon_denom, epsilon_denom, rho_de_a)
+    w_de_a = (phi_prime_a**2 / (2 * a**2) - V0) / rho_de_a_safe
+
+    # Calculate H_curly (dimensionless Hubble parameter) for each a
+    # We need to calculate it using the values of phi_a and phi_prime_a at each step
+    H_curly_a = np.array([H_curly([phi_a[i], phi_prime_a[i]], a[i], V0, rho_dm_a[i]) for i in range(len(a))])
+
+    # Calculate effective equation of state using the provided expression
+    # w_eff = w_phi + (phi_prime / (3 * H_curly * phi)) * (rho_chi / rho_phi)
+    # Add a small epsilon to denominators to prevent division by zero for numerical stability
+    phi_a_safe = np.where(np.abs(phi_a) < epsilon_denom, epsilon_denom, phi_a)
+    H_curly_a_safe = np.where(np.abs(H_curly_a) < epsilon_denom, epsilon_denom, H_curly_a)
+    
+    # This is the coupling term for w_eff
+    coupling_term_a = (phi_prime_a / (3 * H_curly_a_safe * phi_a_safe)) * (rho_dm_a / rho_de_a_safe)
+    w_eff_a = w_de_a + coupling_term_a
+
+    # Calculate new quantities:
+    phi_prime_over_H_phi = phi_prime_a / (H_curly_a_safe * phi_a_safe)
+    slow_roll_ratio_a = phi_prime_a / (rho_dm_a / (3 * H_curly_a * phi_a))
+    ratio2_a = phi_a / (np.sqrt(rho_dm_a) / H0)
+
+    return {
+        'phi_a': phi_a,
+        'phi_prime_a': phi_prime_a,
+        'rho_de_a': rho_de_a,
+        'rho_dm_a': rho_dm_a,
+        'w_de_a': w_de_a,
+        'rho_tot_a': rho_tot_a,
+        'w_eff_a': w_eff_a,
+        'rho_r_a': rho_r_a,
+        'rho_b_a': rho_b_a,
+        'H_curly_a': H_curly_a,
+        'w_eff_coupling_term_a': coupling_term_a, 
+        'phi_prime_over_H_phi': phi_prime_over_H_phi,
+        'slow_roll_ratio_a': slow_roll_ratio_a,
+        'ratio2_a': ratio2_a
+    }
+
+
+#============================================================================
+# --- Core Functions for Camb analysis ---
+#============================================================================
+
+import camb
+
+def setup_camb_params(h_val: float, omegabh2_val: float, omegach2_val: float, As_val: float, ns_val: float,
+                      phi_i_val: float, phi_prime_i_val: float, alpha_val: float) -> camb.CAMBparams:
+    """Configures and returns CAMB parameters for the Hybrid Quintessence model."""
+    params = camb.set_params(
+        H0=100 * h_val, ombh2=omegabh2_val, omch2=omegach2_val, TCMB=2.7255,
+        dark_energy_model='HybridQuintessence',
+        phi_i=phi_i_val, phi_prime_i=phi_prime_i_val, alpha=alpha_val,
+        omnuh2=0, num_nu_massless=3.044, num_nu_massive=0,
+        nu_mass_degeneracies=[0], nu_mass_numbers=[0],
+        As=As_val, ns=ns_val, tau=0.0544,
+        YHe=0.246, WantTransfer=True
+    )
+    params.NonLinear = camb.model.NonLinear_none
+    return params
+
+def calculate_background_quantities(results: camb.CAMBdata, scale_factor_arr: np.ndarray) -> Dict[str, np.ndarray]:
+    """Calculates and returns relevant background quantities from CAMB results."""
+    rhos = results.get_background_densities(scale_factor_arr)
+    H = scale_factor_arr * results.h_of_z(1 / scale_factor_arr - 1)
+    _, w_de = results.get_dark_energy_rho_w(scale_factor_arr)
+    rho_de = rhos['de'] / scale_factor_arr**4
+    rho_cdm = rhos['cdm'] / scale_factor_arr**4
+
+    de = results.Params.DarkEnergy
+    # Ensure interpolation is done on the full scale_factor_arr array
+    phi_interpolator = interp1d(de.sampled_a, de.phi_a, bounds_error=False, fill_value="extrapolate")
+    phi_prime_interpolator = interp1d(de.sampled_a, de.phidot_a, bounds_error=False, fill_value="extrapolate")
+    phi = phi_interpolator(scale_factor_arr)
+    phi_prime = phi_prime_interpolator(scale_factor_arr)
+
+    # Add a small epsilon to denominators to prevent division by zero or very small numbers
+    epsilon = 1e-30 # A small value for numerical stability
+    phi_safe = np.where(np.abs(phi) < epsilon, epsilon, phi)
+    H_safe = np.where(np.abs(H) < epsilon, epsilon, H)
+    
+    # New quantities
+
+    phi_prime_over_H_phi = phi_prime / (H_safe * phi_safe)
+    w_eff = w_de + phi_prime * rho_cdm / (phi * 3 * H * rho_de)
+    slow_roll_ratio = phi_prime / (rho_cdm / (3 * H * phi)) # when phi'' = 0
+    ratio2 = phi / (np.sqrt(rho_cdm) / H0)
+
+    return {
+        'H': H,
+        'w_de': w_de,
+        'rho_de': rho_de,
+        'rho_cdm': rho_cdm,
+        'phi': phi,
+        'phi_prime': phi_prime,
+        'de_params': de, 
+        'phi_prime_over_H_phi': phi_prime_over_H_phi,
+        'w_eff': w_eff,
+        'slow_roll_ratio': slow_roll_ratio,
+        'ratio2': ratio2
+    }
+
+#============================================================================
+# --- Function to compare ---
+#============================================================================
+
+def comparing(
+        hds_quantity: str,
+        camb_quantity: str,
+        ic_list: List[Tuple[float, float]],
+        title: str,
+        a_ini: float = 1e-7
+):
+    """
+    Compares a given quantity from the HDS model to the same quantity from CAMB.
+    Plots a 3x1 figure: 
+    1. The ratio of the quantities.
+    2. The HDS quantity vs. scale factor.
+    3. The CAMB quantity vs. scale factor.
+    """
+    # Create a 3x1 subplot figure. sharex=True links the x-axes.
+    fig, axes = plt.subplots(1, 3, figsize=(20, 8), sharex=True)
+    
+    # --- CAMB fixed parameters ---
+    As = 2.1e-9
+    ns = 0.9665
+    alpha = 1.0  # This alpha is hardcoded in the CAMB HybridQuintessence model.
+
+    for ic in ic_list:
+        phi_i, phi_prime_i = ic
+        try:
+            # --- HDS Simulation ---
+            a_hds, result_hds, V0_hds, rho_dm_i_hds = solve_system(
+                ic_phi=phi_i,
+                ic_phi_prime=phi_prime_i,
+                a_ini=a_ini,
+                a_end=1.0,
+                n_steps=1000,
+                V0_guess_1=1.15 * rho_cr * omega_de,
+                V0_guess_2=0.9 * rho_cr * omega_de
+            )
+            hds_results = calculate_derived_quantities(a_hds, result_hds, V0_hds, rho_dm_i_hds, a_ini, phi_i)
+
+            # --- CAMB Simulation ---
+            params = setup_camb_params(h, omega_b, omega_c, As, ns, phi_i, phi_prime_i, alpha)
+            params.set_for_lmax(lmax=1)
+            results_camb = camb.get_results(params)
+            camb_results = calculate_background_quantities(results_camb, a_hds)
+
+            # --- Plotting ---
+            if hds_quantity in hds_results and camb_quantity in camb_results:
+                # Common label for the line in all subplots
+                line_label = r"$\phi_i={:.1f}, \phi'_i={:.1f}$".format(ic[0], ic[1])
+                
+                # Plot 1: Ratio of HDS / CAMB
+                ratio = hds_results[hds_quantity] / camb_results[camb_quantity]
+                axes[0].plot(a_hds, ratio, label=line_label)
+
+                # Plot 2: HDS quantity
+                axes[1].plot(a_hds, hds_results[hds_quantity], label=line_label)
+
+                # Plot 3: CAMB quantity
+                axes[2].plot(a_hds, camb_results[camb_quantity], label=line_label)
+            else:
+                logging.error(f"Error: One or both quantities not found. HDS: '{hds_quantity}', CAMB: '{camb_quantity}'")
+                continue
+
+        except RuntimeError as e:
+            logging.error(f"Error running simulation for IC {ic}: {e}")
+            continue
+
+    # --- Formatting and Labels for each subplot ---
+
+    # Plot 1: Ratio
+    axes[0].axhline(y=1.0, color='red', linestyle='--', linewidth=1.5, label='Perfect Agreement (Ratio = 1)')
+    axes[0].set_ylabel(f'Ratio: {hds_quantity} / {camb_quantity}')
+    axes[0].set_title('Comparison Ratio') 
+    axes[0].legend(title='Initial Conditions')
+    axes[0].grid(True, which="both", ls="--", alpha=0.5)
+
+    # Plot 2: HDS Quantity
+    axes[1].set_ylabel(f'HDS: {hds_quantity}')
+    axes[1].set_title('HDS Model Results')
+    axes[1].legend(title='Initial Conditions')
+    axes[1].grid(True, which="both", ls="--", alpha=0.5)
+
+    # Plot 3: CAMB Quantity
+    axes[2].set_ylabel(f'CAMB: {camb_quantity}')
+    axes[2].set_title('CAMB Model Results')
+    axes[2].legend(title='Initial Conditions')
+    axes[2].grid(True, which="both", ls="--", alpha=0.5)
+
+    # Automatically set y-scale to log for densities, linear for others (like w_eff)
+    if 'rho' in hds_quantity.lower():
+        axes[1].set_yscale('log')
+        axes[2].set_yscale('log')
+        
+    # Common X-axis settings
+    plt.xlabel('Scale Factor ($a$)')
+    plt.xscale('log')
+    plt.xlim(1e-5, 1)
+
+    # Add a main title to the entire figure
+    fig.suptitle(title, fontsize=16)
+    
+    # Adjust layout to prevent titles and labels from overlapping
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) # rect leaves space for the suptitle
+
+    plt.show()
+
+#============================================================================
+# --- Plots to compare ---
+#============================================================================
+
+# Define different sets of initial conditions for the scalar field
+# for a set of initial parameters (\phi_i, phi'_i)
+initial_conditions = [
+    (10.0, 1e1),
+    (10.0, 1e2),
+    (10.0, 1e3)
+]
+
+# Compare the dark energy density (rho_de_a) from HDS to CAMB
+
+comparing(
+    hds_quantity='rho_de_a', 
+    camb_quantity='rho_de', 
+    ic_list=initial_conditions, 
+    title='Ratio of Dark Energy Density: HDS vs. CAMB'
+)
+
+
+# Compare the effective equation of state (w_eff)
+
+comparing(
+    hds_quantity='w_eff_a',
+    camb_quantity='w_eff',
+    ic_list=initial_conditions,
+    title='Ratio of Effective EoS: HDS vs. CAMB'
+)
+
+
+# Compare slow-roll ratios
+
+comparing(
+    hds_quantity='slow_roll_ratio_a',
+    camb_quantity='slow_roll_ratio',
+    ic_list=initial_conditions,
+    title='Ratio of Slow-Roll Quantity: HDS vs. CAMB'
+)
+
+comparing(
+    hds_quantity='ratio2_a',
+    camb_quantity='ratio2',
+    ic_list=initial_conditions,
+    title='Ratio of Slow-Roll Quantity: HDS vs. CAMB'
+)
