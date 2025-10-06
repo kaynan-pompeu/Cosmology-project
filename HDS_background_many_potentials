@@ -1,5 +1,6 @@
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import abc
 from scipy.interpolate import interp1d
@@ -24,6 +25,8 @@ omega_r = omega_phot + omega_massless_nu
 omega_de = 1 - omega_c - omega_b - omega_r
 omega_de_target = omega_de
 omega_c_target = omega_c
+
+global_alpha=1
 
 # =============================================================================
 # Base abstract class for potentials
@@ -124,6 +127,9 @@ class PowerLawPotential(ScalarPotential):
         B = self.params['B']
         C = self.params['C']
         return B + 2 * C * phi
+    
+class GaussianPotential(ScalarPotential):
+    pass
 
 # =============================================================================
 # 3. Main functions for HDS solving
@@ -147,9 +153,11 @@ def equations(y: List[float], a: float, rho_dm_i: float, a_i: float, phi_i: floa
     Defines the Klein-Gordon equation for the DE field and the analytical expression for the CDM energy density.
     The integration variable is the scale factor 'a'.
     """
+    
+    alpha = global_alpha # I really have to see what is going on with this boy...
 
     phi, phi_prime = y
-    rho_dm = rho_dm_i * (phi / phi_i) * (a_i / a)**3
+    rho_dm = rho_dm_i * ((phi / phi_i)**alpha) * (a_i / a)**3
 
     H = H_curly(y, a, rho_dm, potential_object)
     
@@ -162,7 +170,7 @@ def equations(y: List[float], a: float, rho_dm_i: float, a_i: float, phi_i: floa
 
     # Assumes y = [phi, phi'], where phi' is the derivative wrt conformal time (eta)
     dphi_da = phi_prime / (a * H_safe)
-    dphi_prime_da = -2 * phi_prime / a - (a * dV_dphi_val / H_safe) - (a * rho_dm / (phi_safe * H_safe))
+    dphi_prime_da = -2 * phi_prime / a - (a * dV_dphi_val / H_safe) - (a * rho_dm * alpha / (phi_safe * H_safe))
     
     return np.array([dphi_da, dphi_prime_da])
 
@@ -229,7 +237,7 @@ def _shoot_for_rho_dm_i(ic: List[float], a_ini: float, a_end: float, n_steps: in
     
     # --- Attempt 1: Secant Method ---
     converged = False
-    for _ in range(10):
+    for _ in range(20):
         _, result_1 = integrate_cosmo(ic, a_ini, a_end, n_steps, rho_dm_i_1, potential_object)
         _, omega_c_1 = find_present_day_fractions(result_1, a_ini, rho_dm_i_1, potential_object)
         _, result_2 = integrate_cosmo(ic, a_ini, a_end, n_steps, rho_dm_i_2, potential_object)
@@ -310,9 +318,9 @@ def solve_system(
     converged = False
     final_result, final_potential, final_rho_dm_i = result2, potential2, rho_dm_i2
     for i in range(20):
-        if abs(p2 - p1) < 1e-20: break
+        if abs(p2 - p1) < 1e-10: break
         slope = (omega_de2 - omega_de1) / (p2 - p1)
-        if abs(slope) < 1e-20: break
+        if abs(slope) < 1e-10: break
         
         p_next = p2 - (omega_de2 - omega_de_target) / slope
         params_next = initial_params.copy(); params_next[param_to_shoot] = p_next
@@ -395,7 +403,7 @@ def calculate_derived_quantities(
     # Equation of state and interaction terms
     w_phi = (0.5 * phi_prime_arr**2 / (a**2) - V_of_phi) / rho_phi_safe
     interaction = -rho_dm_arr / phi_safe
-    coupling = (phi_prime_arr / (3 * H_curly_safe * phi_safe)) * (rho_dm_arr / rho_phi_safe)
+    coupling = (phi_prime_arr * global_alpha / (3 * H_curly_safe * phi_safe)) * (rho_dm_arr / rho_phi_safe)
     w_eff = w_phi + coupling
 
     return {
@@ -418,9 +426,9 @@ def run_full_simulation(
     default_guesses: Dict[str, List[float]]
 ) -> Dict[str, Any]:
     """
-    Wrapper that configures and runs the entire simulation.
+    High-level wrapper that configures and runs the entire simulation.
     """
-    # Parse the parameter vector
+    # 1. Parse the parameter vector to find which parameter to shoot for
     param_to_shoot = None
     initial_params = {}
     for key, value in params_vector_to_shoot.items():
@@ -432,23 +440,30 @@ def run_full_simulation(
     if param_to_shoot is None:
         raise ValueError("Shooting parameter not specified. Set one parameter to `True`.")
 
-    # Get shooting guesses from the provided dictionary
+    # 2. Get shooting guesses from the provided dictionary
     if param_to_shoot not in default_guesses:
         raise NotImplementedError(f"No default shooting guesses configured for parameter '{param_to_shoot}'")
     guess1, guess2 = default_guesses[param_to_shoot]
 
-    # Run the solver
+    # 3. Run the solver
     a, result, potential_obj, rho_dm_i_final = solve_system(
         ic_phi=phi_i, ic_phi_prime=phi_prime_i, a_ini=a_ini, a_end=a_end, n_steps=n_steps,
         potential_flag=potential_flag, initial_params=initial_params,
         param_to_shoot=param_to_shoot, guess_1=guess1, guess_2=guess2
     )
 
-    # Return results
+    # 4. Post-process the results
     derived_quantities = calculate_derived_quantities(
         a, result, a_ini, rho_dm_i_final, potential_obj
     )
+    
+    # 5. Add initial conditions and final potential to results for plotting
     derived_quantities['potential_object'] = potential_obj
+    derived_quantities['initial_conditions'] = {
+        'phi_i': phi_i,
+        'phi_prime_i': phi_prime_i,
+        'a_ini': a_ini
+    }
     return derived_quantities
 
 def find_critical_point(scale_factor_arr: np.ndarray, phi_prime_arr: np.ndarray) -> float:
@@ -462,6 +477,17 @@ def find_critical_point(scale_factor_arr: np.ndarray, phi_prime_arr: np.ndarray)
         a_c = (scale_factor_arr[c] + scale_factor_arr[c+1]) / 2
         return a_c
     return 0.0
+
+def find_w_phi_critical_points(w_phi: np.ndarray) -> np.ndarray:
+    """
+    Finds the indices of critical points (local maxima and minima) of the w_phi array.
+    """
+    # Calculate the sign of the discrete derivative of w_phi
+    deriv_sign = np.sign(np.diff(w_phi))
+    # Find indices where the sign changes (e.g., from +1 to -1 or vice-versa)
+    # We add 1 to the index because np.diff reduces the array length by one.
+    critical_indices = np.where(np.diff(deriv_sign) != 0)[0] + 1
+    return critical_indices
 
 def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[float, float]]:
     """
@@ -488,6 +514,159 @@ def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[f
                 crossings.append((crossing_a, crossing_z))
     return crossings
 
+def plot_eos_eff(results: Dict[str, Any], 
+                 show_phantom_crossings=True, 
+                 show_eos=True, 
+                 show_critical_points=True,
+                 xlim: Optional[List[float]] = None,
+                 ylim: Optional[List[float]] = None,
+                 use_redshift=False,
+                 show_initial_parameters=True,
+                 show_phantom_redshifts=True,
+                 show_phantom_phase=False
+                 ) -> None:
+    """
+    Plots the effective equation of state and other diagnostic quantities.
+    This function is now fully featured based on the input parameters.
+    """
+    logging.info("--- Plotting Results ---")
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # --- Setup X-axis: Redshift or Scale Factor ---
+    if use_redshift:
+        x_data = 1 / results['a'] - 1
+        xlabel = "Redshift (z)"
+        # Flip the x-axis for redshift
+        ax.invert_xaxis()
+    else:
+        x_data = results['a']
+        xlabel = "Scale Factor (a)"
+    
+    # --- Plot main data ---
+    if show_eos:
+        ax.plot(x_data, results['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
+    ax.plot(x_data, results['w_eff'], label=r'$w_{eff}$ (DE + Interaction)', color='black')
+    ax.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
+
+    # --- Show Phantom Phase Region ---
+    if show_phantom_phase:
+        ax.fill_between(x_data, results['w_eff'], -1, where=results['w_eff'] < -1, 
+                        color='red', alpha=0.2, label='Phantom Phase')
+
+    # --- Show Phantom Crossings ---
+    if show_phantom_crossings:
+        crossings = find_all_phantom_crossings(results['a'], results['w_eff'])
+        for i, (crossing_a, crossing_z) in enumerate(crossings):
+            x_crossing = crossing_z if use_redshift else crossing_a
+            ax.axvline(x_crossing, color='purple', linestyle='-.', alpha=0.7, 
+                       label='Phantom Crossing' if i == 0 else "")
+            if show_phantom_redshifts:
+                ax.text(x_crossing * 1.1, ax.get_ylim()[0] * 0.1, f'z={crossing_z:.2f}', 
+                        color='purple', rotation=90)
+
+    # --- Show Critical Points of w_phi ---
+    if show_critical_points:
+        crit_indices = find_w_phi_critical_points(results['w_phi'])
+        if len(crit_indices) > 0:
+            x_crit = x_data[crit_indices]
+            y_crit = results['w_phi'][crit_indices]
+            ax.scatter(x_crit, y_crit, marker='o', s=80, facecolors='none', edgecolors='green',
+                       zorder=5, label=r'Critical Points of $w_{\phi}$')
+
+    # --- Set plot limits ---
+    if xlim:
+        ax.set_xlim(xlim)
+    if ylim:
+        ax.set_ylim(ylim)
+    else:
+        # Default ylim if not provided
+        ax.set_ylim(-1.5, 1.2)
+
+    # --- Show Initial Parameters in Legend ---
+    handles, labels = ax.get_legend_handles_labels()
+    if show_initial_parameters:
+        ic = results['initial_conditions']
+        pot_obj = results['potential_object']
+        
+        # Format the parameters into a nice string
+        # This line was fixed to correctly access the dictionary keys
+        ic_text = (
+            f"Initial Conditions:\n"
+            fr"  $a_i = {ic['a_ini']:.1e}$"
+            fr", $\phi_i = {ic['phi_i']}$"
+            fr", $\phi'_i = {ic['phi_prime_i']}$"
+        )
+        
+        # Create a dummy artist to display the text in the legend
+        extra = Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', linewidth=0)
+        handles.append(extra)
+        labels.append(ic_text)
+
+    # --- Final plot setup ---
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Equation of State (w)")
+    ax.set_title(f"Equation of State Evolution\n{results['potential_object']}")
+    if not use_redshift:
+        ax.set_xscale('log')
+    ax.legend(handles, labels, loc='best')
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
+
+def plot_sweep_results(results_list: List[Dict[str, Any]], sweep_parameter: str, use_redshift: bool = False, x_lim=None, y_lim=None) -> None:
+    """
+    Plots the results from a parameter sweep on a single graph.
+    """
+    logging.info(f"--- Plotting Sweep Results for parameter '{sweep_parameter}' ---")
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # --- Setup X-axis: Redshift or Scale Factor ---
+    if use_redshift:
+        xlabel = "Redshift (z)"
+    else:
+        xlabel = "Scale Factor (a)"
+
+    # --- Plot data from each simulation in the sweep ---
+    for i, results in enumerate(results_list):
+        if use_redshift:
+            x_data = 1 / results['a'] - 1
+        else:
+            x_data = results['a']
+        
+        # Create a label for this specific run. This logic is now corrected.
+        sweep_val = results['initial_conditions'][sweep_parameter]
+        # Robustly create LaTeX label
+        parts = sweep_parameter.split('_')
+        if len(parts) == 2:
+            latex_name = fr"\{parts[0]}_{{{parts[1]}}}"
+        else:
+            latex_name = sweep_parameter
+        
+        label = fr'$w_{{eff}}$ for ${latex_name} = {sweep_val}$'
+        ax.plot(x_data, results['w_eff'], label=label)
+
+    # --- Final plot setup ---
+    ax.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
+    if use_redshift:
+        ax.invert_xaxis()
+    else:
+        ax.set_xscale('log')
+        
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Effective Equation of State ($w_{eff}$)")
+    ax.set_title(f"Parameter Sweep for '{sweep_parameter}'\n{results_list[0]['potential_object'].name} Potential")
+    if x_lim:
+        ax.set_xlim(x_lim)
+    if y_lim:
+        ax.set_ylim(y_lim)
+    ax.legend(loc='best')
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
+
+def plot_background_species(results: Dict[str, Any], use_redshift=False, xlim=None, ylim=None, compare_with_LCDM=False) -> None:
+    pass
+
 
 # This dictionary maps an integer flag to the corresponding potential class.
 # To add a new potential, define its class and then add an
@@ -495,20 +674,32 @@ def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[f
 potential_factory: Dict[int, Type[ScalarPotential]] = {
         1: ConstantPotential,
         2: ExponentialPotential,
-        3: PowerLawPotential, 
+        3: PowerLawPotential,
+        4: GaussianPotential, # Placeholder for future implementation 
     }
 
 if __name__ == '__main__':
+
+    #Flags to display simulations
+    PLOT_EQUATION_OF_STATE = True
+    PLOT_FIELD_EVOLUTION = False
+    PLOT_BACKGROUND_EVOLUTION_SPECIES = False
+    
+    # --- Control Parameter Sweep ---
+    # Set to a string like 'phi_i' or 'phi_prime_i' to activate sweep mode.
+    # Set to None to run a single simulation.
+    sweep_parameter = 'phi_prime_i'
+    sweep_values = [0, 1e1, 1e2, 1e3]
     
     # --- Set Initial Simulation Parameters ---
-    potential_flag = 3
+    potential_flag = 1
     # For flag=1, this would be: {'V0': True}, for flag=2, this would be (for example): {'A': True, 'B': -0.1}
     # params_vector_to_shoot = {'V0': True} # Define which parameters are fixed and which one to solve for (True)
-    params_vector_to_shoot = {'A': True, 'B': -0.1, 'C': 0.0} # bissection is not working properly here, need to check
+    params_vector_to_shoot = {'V0': True} # bissection is not working properly here, need to check
 
     default_guesses = {
         'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # Standard guessses, we know it works
-        'A':  [-1e-6, 1e-6], # For exponential potential: A = [1e-7, 1e-8], B = [-0.05, 0.05], these usually work for secant method
+        'A':  [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # For exponential potential: A = [1e-7, 1e-8], B = [-0.05, 0.05], these usually work for secant method
         'B':  [-1e5, 1e5],
         'C':  [1e-7, 1e-8]
     }
@@ -516,9 +707,9 @@ if __name__ == '__main__':
     a_ini = 1e-4
     a_end = 1.0
     n_steps = 500000
-    phi_i = 10.0
-    phi_prime_i = 1.5e1
-
+    phi_i_base = 10.0
+    phi_prime_i_base = 2e1
+    
     """
     # There is a curious phantom crossing for these parameters
         params_vector_to_shoot = {'A': True, 'B': -0.23} 
@@ -530,40 +721,51 @@ if __name__ == '__main__':
         'C':  [1e-7, 1e-8]
     }
     """
-
-    def plot_EoS(results: Dict[str, Any]):
-        """Placeholder function to demonstrate plotting."""
-        logging.info("--- Plotting Results ---")
-        plt.figure(figsize=(10, 6))
-        plt.plot(results['a'], results['w_phi'], label=r'$w_{\phi}$')
-        plt.plot(results['a'], results['w_eff'], label=r'$w_{eff}$', linestyle='--')
-        plt.axhline(-1, color='r', linestyle=':', label='Phantom Divide')
-        plt.xlabel("Scale Factor (a)")
-        plt.ylabel("Equation of State (w)")
-        plt.ylim(-1.5, 1.2)
-        plt.title(f"Equation of State Evolution\n{results['potential_object']}")
-        plt.xscale('log')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        print("Plotting function called. Final w_phi at a=1 is:", results['w_phi'][-1])
-
-    try:
-        # --- Run the full simulation and get all results ---
-        results = run_full_simulation(
-            potential_flag=potential_flag,
-            params_vector_to_shoot=params_vector_to_shoot,
-            a_ini=a_ini, a_end=a_end, n_steps=n_steps,
-            phi_i=phi_i, phi_prime_i=phi_prime_i,
-            default_guesses=default_guesses
-        )
-
-        print("\n--- Final Converged Solution & Results ---")
-        print(f"Final Potential: {results['potential_object']}")
+    
+    # --- Main Execution Logic: Single Run vs. Parameter Sweep ---
+    if sweep_parameter is None:
+        # --- Single Simulation Run ---
+        if PLOT_EQUATION_OF_STATE:
+            try:
+                # Prepare a dictionary of the base parameters
+                sim_params = {
+                    'potential_flag': potential_flag,
+                    'params_vector_to_shoot': params_vector_to_shoot,
+                    'a_ini': a_ini, 'a_end': a_end, 'n_steps': n_steps,
+                    'phi_i': phi_i_base, 'phi_prime_i': phi_prime_i_base,
+                    'default_guesses': default_guesses
+                }
+                results = run_full_simulation(**sim_params)
+                print("\n--- Final Converged Solution & Results ---")
+                print(f"Final Potential: {results['potential_object']}")
+                plot_eos_eff(results, use_redshift=True, show_phantom_phase=True, xlim=[0, 50], ylim=[-1.5, 1.2])
+            except (RuntimeError, NotImplementedError, ValueError) as e:
+                logging.error(f"Single simulation failed: {e}")
+    else:
+        # --- Parameter Sweep Run ---
+        logging.info(f"--- Starting Parameter Sweep for '{sweep_parameter}' ---")
+        all_results = []
         
-        # --- Call plotting function with the results ---
-        plot_EoS(results)
+        # Prepare a dictionary of the base parameters
+        sim_params = {
+            'potential_flag': potential_flag,
+            'params_vector_to_shoot': params_vector_to_shoot,
+            'a_ini': a_ini, 'a_end': a_end, 'n_steps': n_steps,
+            'phi_i': phi_i_base, 'phi_prime_i': phi_prime_i_base,
+            'default_guesses': default_guesses
+        }
 
-    except (RuntimeError, NotImplementedError, ValueError) as e:
-        logging.error(f"Simulation failed: {e}")
+        for value in sweep_values:
+            logging.info(f"\n--- Running for {sweep_parameter} = {value} ---")
+            # Update the sweep parameter for this specific run
+            sim_params[sweep_parameter] = value
+            try:
+                results = run_full_simulation(**sim_params)
+                all_results.append(results)
+            except (RuntimeError, NotImplementedError, ValueError) as e:
+                logging.error(f"Simulation failed for {sweep_parameter} = {value}: {e}")
+        
+        # After all simulations are done, plot the combined results
+        if all_results:
+            plot_sweep_results(all_results, sweep_parameter, use_redshift=True, x_lim=[0, 150], y_lim=[-2.5, 2.2])
 
