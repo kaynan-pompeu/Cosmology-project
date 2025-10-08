@@ -6,7 +6,7 @@ import abc
 from scipy.interpolate import interp1d
 import logging
 from typing import List, Dict, Any, Tuple, Optional, Type
-from scipy.integrate import odeint
+from scipy.integrate import odeint, cumulative_trapezoid
 
 # Set up logging for better feedback
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -26,7 +26,7 @@ omega_de = 1 - omega_c - omega_b - omega_r
 omega_de_target = omega_de
 omega_c_target = omega_c
 
-global_alpha=1
+global_alpha=1 # 0.2, 0.5 and 0.7 are interesting for Gaussian, probably look like K-essence
 
 # =============================================================================
 # Base abstract class for potentials
@@ -129,7 +129,49 @@ class PowerLawPotential(ScalarPotential):
         return B + 2 * C * phi
     
 class GaussianPotential(ScalarPotential):
-    pass
+    """
+    A Gaussian potential of the form V(phi) = A*exp{-B*(x-C)**2}.
+    """
+    def __init__(self, A: float, B: float, C: float):
+        super().__init__("Gaussian")
+        self.params['A'] = A
+        self.params['B'] = B
+        self.params['C'] = C
+
+    def value(self, phi: float) -> float:
+        """Calculates V(phi) = V(phi) = A*exp{-B*(x-C)**2}."""
+        A = self.params['A']
+        B = self.params['B']
+        C = self.params['C']
+        return A*(np.exp(-B*(phi-C)**2))
+
+    def derivative(self, phi: float) -> float:
+        """Calculates dV/dphi = -2*B*(phi-C)*V(phi)."""
+        A = self.params['A']
+        B = self.params['B']
+        C = self.params['C']
+        return -2*B*(phi-C)*self.value(phi)
+
+class InversePowerLawPotential(ScalarPotential):
+    """
+    An inverse power law potential of the form V(phi) = A * phi^(-B).
+    """
+    def __init__(self, A: float, B: float):
+        super().__init__("Inverse Power Law")
+        self.params['A'] = A
+        self.params['B'] = B
+
+    def value(self, phi: float) -> float:
+        """Calculates V(phi) = A * phi^(-B)."""
+        A = self.params['A']
+        B = self.params['B']
+        return np.where(phi != 0, A * phi**(-B), -np.inf)
+    
+    def derivative(self, phi: float) -> float:
+        """Calculates dV/dphi = -A * B * phi^(-B-1)."""
+        A = self.params['A']
+        B = self.params['B']
+        return np.where(phi != 0, -A * B * phi**(-B - 1), -np.inf)
 
 # =============================================================================
 # 3. Main functions for HDS solving
@@ -390,29 +432,51 @@ def calculate_derived_quantities(
     V_of_phi = potential_object.value(phi_arr)
     rho_dm_arr = rho_dm_i * (phi_arr / phi_i) * (a_ini / a)**3
     rho_phi_arr = 0.5 * phi_prime_arr**2 / (a**2) + V_of_phi
-
+    rho_r_arr = rho_cr * omega_r * a**(-4)
+    rho_b_arr = rho_cr * omega_b * a**(-3)
+    
     H_curly_arr = np.array([H_curly(y, val_a, val_rho_dm, potential_object)
                             for y, val_a, val_rho_dm in zip(result, a, rho_dm_arr)])
 
-    # Add safety checks for division by zero
     epsilon = 1e-40
     rho_phi_safe = np.where(np.abs(rho_phi_arr) < epsilon, epsilon, rho_phi_arr)
     phi_safe = np.where(np.abs(phi_arr) < epsilon, epsilon, phi_arr)
     H_curly_safe = np.where(np.abs(H_curly_arr) < epsilon, epsilon, H_curly_arr)
 
-    # Equation of state and interaction terms
     w_phi = (0.5 * phi_prime_arr**2 / (a**2) - V_of_phi) / rho_phi_safe
     interaction = -rho_dm_arr / phi_safe
-    coupling = (phi_prime_arr * global_alpha / (3 * H_curly_safe * phi_safe)) * (rho_dm_arr / rho_phi_safe)
+    coupling = (phi_prime_arr / (3 * H_curly_safe * phi_safe)) * (rho_dm_arr / rho_phi_safe)
     w_eff = w_phi + coupling
+
+    # --- Calculate Effective Potential ---
+    # The total "force" on the field is dV/dphi + interaction_term
+    dV_dphi_arr = potential_object.derivative(phi_arr)
+    interaction_force_arr = rho_dm_arr / phi_safe
+    total_force_arr = dV_dphi_arr + interaction_force_arr
+    
+    # To integrate wrt phi, we must sort by phi as it may not be monotonic
+    sort_indices = np.argsort(phi_arr)
+    phi_sorted = phi_arr[sort_indices]
+    force_sorted = total_force_arr[sort_indices]
+    
+    # Integrate and then unsort back to the original time-ordered sequence
+    V_eff_integrated_sorted = cumulative_trapezoid(force_sorted, phi_sorted, initial=0)
+    # Set the constant of integration so V_eff = V at the start
+    V_eff_integrated_sorted += V_of_phi[sort_indices][0] - V_eff_integrated_sorted[0]
+    
+    unsort_indices = np.argsort(sort_indices)
+    V_eff_arr = V_eff_integrated_sorted[unsort_indices]
 
     return {
         "a": a,
         "phi": phi_arr,
         "phi_prime": phi_prime_arr,
         "V_of_phi": V_of_phi,
+        "V_eff": V_eff_arr,
         "rho_dm": rho_dm_arr,
         "rho_phi": rho_phi_arr,
+        "rho_r": rho_r_arr,
+        "rho_b": rho_b_arr,
         "H_curly": H_curly_arr,
         "w_phi": w_phi,
         "interaction": interaction,
@@ -514,6 +578,10 @@ def find_all_phantom_crossings(a: np.ndarray, w_eff: np.ndarray) -> List[Tuple[f
                 crossings.append((crossing_a, crossing_z))
     return crossings
 
+# =============================================================================
+# 6. Plotting functions
+# =============================================================================
+
 def plot_eos_eff(results: Dict[str, Any], 
                  show_phantom_crossings=True, 
                  show_eos=True, 
@@ -523,94 +591,182 @@ def plot_eos_eff(results: Dict[str, Any],
                  use_redshift=False,
                  show_initial_parameters=True,
                  show_phantom_redshifts=True,
-                 show_phantom_phase=False
+                 show_phantom_phase=False,
+                 plot_potential_together=False,
+                 plot_effective_potential=False,
+                 plot_field_evolution=False,
+                 show_V_x_phi=False
                  ) -> None:
     """
-    Plots the effective equation of state and other diagnostic quantities.
-    This function is now fully featured based on the input parameters.
+    Plots the effective equation of state and, optionally, the potential evolution.
     """
     logging.info("--- Plotting Results ---")
-    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # --- Setup Figure: Determine number of panels ---
+    num_panels = 1
+    if plot_potential_together:
+        num_panels += 1
+    if show_V_x_phi:
+        num_panels += 1
 
-    # --- Setup X-axis: Redshift or Scale Factor ---
+    if num_panels == 1:
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+        ax2, ax3 = None, None
+    elif num_panels == 2:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+        ax3 = None
+    else: # num_panels == 3
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 7))
+
+    # --- Setup X-axis for time-evolution plots ---
     if use_redshift:
         x_data = 1 / results['a'] - 1
         xlabel = "Redshift (z)"
-        # Flip the x-axis for redshift
-        ax.invert_xaxis()
+        ax1.invert_xaxis()
+        if ax2: ax2.invert_xaxis()
     else:
         x_data = results['a']
         xlabel = "Scale Factor (a)"
-    
-    # --- Plot main data ---
+
+    # --- PANEL 1: Equation of State Plot ---
     if show_eos:
-        ax.plot(x_data, results['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
-    ax.plot(x_data, results['w_eff'], label=r'$w_{eff}$ (DE + Interaction)', color='black')
-    ax.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
+        ax1.plot(x_data, results['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
+    ax1.plot(x_data, results['w_eff'], label=r'$w_{eff}$ (DE + Interaction)', color='black')
+    ax1.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
 
-    # --- Show Phantom Phase Region ---
     if show_phantom_phase:
-        ax.fill_between(x_data, results['w_eff'], -1, where=results['w_eff'] < -1, 
-                        color='red', alpha=0.2, label='Phantom Phase')
+        ax1.fill_between(x_data, results['w_eff'], -1, where=results['w_eff'] < -1, 
+                         color='red', alpha=0.2, label='Phantom Phase')
 
-    # --- Show Phantom Crossings ---
     if show_phantom_crossings:
         crossings = find_all_phantom_crossings(results['a'], results['w_eff'])
         for i, (crossing_a, crossing_z) in enumerate(crossings):
             x_crossing = crossing_z if use_redshift else crossing_a
-            ax.axvline(x_crossing, color='purple', linestyle='-.', alpha=0.7, 
-                       label='Phantom Crossing' if i == 0 else "")
+            ax1.axvline(x_crossing, color='purple', linestyle='-.', alpha=0.7, 
+                        label='Phantom Crossing' if i == 0 else "")
             if show_phantom_redshifts:
-                ax.text(x_crossing * 1.1, ax.get_ylim()[0] * 0.1, f'z={crossing_z:.2f}', 
-                        color='purple', rotation=90)
+                ax1.text(x_crossing * 1.1, ax1.get_ylim()[0] * 0.1, f'z={crossing_z:.2f}', 
+                         color='purple', rotation=90)
 
-    # --- Show Critical Points of w_phi ---
     if show_critical_points:
         crit_indices = find_w_phi_critical_points(results['w_phi'])
         if len(crit_indices) > 0:
             x_crit = x_data[crit_indices]
             y_crit = results['w_phi'][crit_indices]
-            ax.scatter(x_crit, y_crit, marker='o', s=80, facecolors='none', edgecolors='green',
-                       zorder=5, label=r'Critical Points of $w_{\phi}$')
+            ax1.scatter(x_crit, y_crit, marker='o', s=80, facecolors='none', edgecolors='green',
+                        zorder=5, label=r'Critical Points of $w_{\phi}$')
 
-    # --- Set plot limits ---
-    if xlim:
-        ax.set_xlim(xlim)
-    if ylim:
-        ax.set_ylim(ylim)
-    else:
-        # Default ylim if not provided
-        ax.set_ylim(-1.5, 1.2)
+    if xlim: ax1.set_xlim(xlim)
+    if ylim: ax1.set_ylim(ylim)
+    else: ax1.set_ylim(-1.5, 1.2)
+    
+    ax1.set_xlabel(xlabel)
+    ax1.set_ylabel("Equation of State (w)")
+    ax1.set_title(f"Equation of State Evolution")
+    if not use_redshift: ax1.set_xscale('log')
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
 
-    # --- Show Initial Parameters in Legend ---
-    handles, labels = ax.get_legend_handles_labels()
+    # --- Legend Handling ---
+    handles, labels = ax1.get_legend_handles_labels()
     if show_initial_parameters:
         ic = results['initial_conditions']
-        pot_obj = results['potential_object']
-        
-        # Format the parameters into a nice string
-        # This line was fixed to correctly access the dictionary keys
         ic_text = (
             f"Initial Conditions:\n"
             fr"  $a_i = {ic['a_ini']:.1e}$"
             fr", $\phi_i = {ic['phi_i']}$"
             fr", $\phi'_i = {ic['phi_prime_i']}$"
+            fr", $\alpha={global_alpha}$" + "\n"
         )
-        
-        # Create a dummy artist to display the text in the legend
         extra = Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', linewidth=0)
         handles.append(extra)
         labels.append(ic_text)
+    
+    if num_panels > 1:
+        ax1.legend(handles, labels, loc='best')
+    else:
+        ax1.legend(handles, labels, loc='center left', bbox_to_anchor=(1, 0.5))
+        fig.subplots_adjust(right=0.7)
 
-    # --- Final plot setup ---
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Equation of State (w)")
-    ax.set_title(f"Equation of State Evolution\n{results['potential_object']}")
-    if not use_redshift:
-        ax.set_xscale('log')
-    ax.legend(handles, labels, loc='best')
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    plt.tight_layout()
+    # --- PANEL 2: Potential Evolution Plot (Optional) ---
+    if plot_potential_together and ax2:
+        crit_indices_pot = find_w_phi_critical_points(results['V_of_phi'])
+        if len(crit_indices_pot) > 0:
+            x_crit_pot = x_data[crit_indices_pot]
+            y_crit_pot = results['V_of_phi'][crit_indices_pot] / results['V_of_phi'][0]
+            ax2.scatter(x_crit_pot, y_crit_pot, marker='o', s=80, facecolors='none', edgecolors='green',
+                        zorder=5, label=r'Critical Points of $V({\phi}) / V_0$')
+        V_normalized = results['V_of_phi'] / results['V_of_phi'][0]
+        p1, = ax2.plot(x_data, V_normalized, color='darkorange', linestyle='--', label=r'$V/V_i$')
+        ax2.set_ylabel(r'Normalized Potential $V/V_i$', color='darkorange')
+        ax2.tick_params(axis='y', labelcolor='darkorange')
+        #ax2.set_yscale('log')
+        ax2.set_xscale('log')
+
+        if plot_effective_potential:
+            if 'V_eff' in results:
+                ax2.loglog(x_data, results['V_eff'], color='darkorange', label=r'$V_{eff}(\phi)$ (Effective)')
+            else:
+                logging.warning("Effective potential data not found in results; skipping its plot.")
+        
+        lines = [p1]
+        if plot_field_evolution:
+            # Create a twin axis for phi/phi_i
+            ax2b = ax2.twinx()
+            phi_normalized = results['phi'] / results['phi'][0]
+            p2, = ax2b.plot(x_data, phi_normalized, color='blue', linestyle=':', label=r'$\phi/\phi_i$')
+            ax2b.set_ylabel(r'Normalized Field $\phi/\phi_i$', color='blue')
+            ax2b.tick_params(axis='y', labelcolor='blue')
+            lines.append(p2)
+
+        if show_phantom_phase:
+            is_phantom = results['w_eff'] < -1
+            phantom_boundaries = np.diff(np.concatenate(([False], is_phantom, [False])).astype(int))
+            start_indices = np.where(phantom_boundaries == 1)[0]
+            end_indices = np.where(phantom_boundaries == -1)[0]
+            
+            has_phantom_label = False
+            for start_idx, end_idx in zip(start_indices, end_indices):
+                label = 'Phantom Phase' if not has_phantom_label else ''
+                if start_idx < len(x_data) and end_idx <= len(x_data):
+                    ax2.axvspan(x_data[start_idx], x_data[end_idx - 1], color='red', alpha=0.2, label=label)
+                    has_phantom_label = True
+        
+        ax2.set_xlabel(xlabel)
+        ax2.set_title('Potential & Field Evolution')
+        if not use_redshift: ax2.set_xscale('log')
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax2.legend(lines, [l.get_label() for l in lines], loc='best')
+
+    # --- PANEL 3: V(phi) vs phi Plot (Optional) ---
+    if show_V_x_phi and ax3:
+        phi_arr = results['phi']
+        V_normalized = results['V_of_phi'] / results['V_of_phi'][0]
+        ax3.plot(phi_arr, V_normalized, color='purple', label=r'$V(\phi)/V_i$')
+
+        if show_phantom_phase:
+            is_phantom = results['w_eff'] < -1
+            # Find transitions into and out of the phantom phase
+            phantom_boundaries = np.diff(np.concatenate(([False], is_phantom, [False])).astype(int))
+            start_indices = np.where(phantom_boundaries == 1)[0]
+            end_indices = np.where(phantom_boundaries == -1)[0]
+            
+            has_phantom_label = False
+            for start_idx, end_idx in zip(start_indices, end_indices):
+                label = 'Phantom Phase' if not has_phantom_label else ''
+                # Shade based on the phi values during the phantom phase
+                if start_idx < len(phi_arr) and end_idx <= len(phi_arr):
+                    ax3.fill_betweenx(ax3.get_ylim(), phi_arr[start_idx], phi_arr[end_idx - 1], color='red', alpha=0.2, label=label)
+                    has_phantom_label = True
+
+        ax3.set_xlabel(r'Field Value $\phi$')
+        ax3.set_ylabel(r'Normalized Potential $V(\phi)/V_i$')
+        ax3.set_title(r'Field Path in Potential')
+        ax3.set_yscale('log')
+        ax3.legend()
+        ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # --- Final Figure Setup ---
+    fig.suptitle(f"Cosmological Evolution for {results['potential_object']}", fontsize=16)
     plt.show()
 
 def plot_sweep_results(results_list: List[Dict[str, Any]], sweep_parameter: str, use_redshift: bool = False, x_lim=None, y_lim=None) -> None:
@@ -661,12 +817,77 @@ def plot_sweep_results(results_list: List[Dict[str, Any]], sweep_parameter: str,
         ax.set_ylim(y_lim)
     ax.legend(loc='best')
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    plt.tight_layout()
+    # plt.tight_layout()
     plt.show()
 
 def plot_background_species(results: Dict[str, Any], use_redshift=False, xlim=None, ylim=None, compare_with_LCDM=False) -> None:
-    pass
+    """
+    Plots the evolution of the density parameters (Omega) for each cosmic species.
+    """
+    logging.info("--- Plotting Background Species Evolution ---")
+    fig, ax = plt.subplots(figsize=(12, 8))
 
+    a = results['a']
+    
+    # --- Calculate total density from the simulation ---
+    # Note: Using the individual densities from results ensures consistency
+    rho_total = results['rho_r'] + results['rho_b'] + results['rho_dm'] + results['rho_phi']
+
+    # --- Calculate Omega for each species from the simulation ---
+    omega_rad = results['rho_r'] / rho_total
+    omega_baryon = results['rho_b'] / rho_total
+    omega_dm = results['rho_dm'] / rho_total
+    omega_de = results['rho_phi'] / rho_total
+
+    # --- Setup X-axis ---
+    if use_redshift:
+        x_data = 1 / a - 1
+        xlabel = "Redshift (z)"
+        ax.invert_xaxis()
+    else:
+        x_data = a
+        xlabel = "Scale Factor (a)"
+        ax.set_xscale('log')
+
+    # --- Plot the species from the simulation ---
+    ax.plot(x_data, omega_rad, label=r'$\Omega_r$ (Radiation)', color='red')
+    ax.plot(x_data, omega_baryon, label=r'$\Omega_b$ (Baryons)', color='blue')
+    ax.plot(x_data, omega_dm, label=r'$\Omega_{dm}$ (Dark Matter)', color='green')
+    ax.plot(x_data, omega_de, label=r'$\Omega_{de}$ (Dark Energy)', color='purple')
+
+    # --- Compare with LCDM if requested ---
+    if compare_with_LCDM:
+        # Calculate the Hubble parameter squared for a standard LCDM model
+        # The total matter density parameter is omega_b + omega_c (baryons + cold dark matter)
+        H2_lcdm_over_H02 = (omega_r * a**-4 + (omega_b + omega_c_target) * a**-3 + omega_de_target)
+        
+        # Calculate LCDM Omegas by dividing each component's evolution by the total
+        omega_r_lcdm = (omega_r * a**-4) / H2_lcdm_over_H02
+        omega_m_lcdm = ((omega_b + omega_c_target) * a**-3) / H2_lcdm_over_H02
+        omega_de_lcdm = omega_de_target / H2_lcdm_over_H02
+        
+        # Plot LCDM curves
+        ax.plot(x_data, omega_r_lcdm, color='black', linestyle='--', lw=1, label='ΛCDM')
+        ax.plot(x_data, omega_m_lcdm, color='black', linestyle='--', lw=1)
+        ax.plot(x_data, omega_de_lcdm, color='black', linestyle='--', lw=1)
+
+
+    # --- Final plot setup ---
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(r'Density Parameter ($\Omega$)')
+    ax.set_title('Evolution of Cosmic Species')
+    ax.legend(loc='best')
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    if xlim:
+        ax.set_xlim(xlim)
+    if ylim:
+        ax.set_ylim(ylim)
+    else:
+        ax.set_ylim(0, 1.1)
+
+    # plt.tight_layout()
+    plt.show()
 
 # This dictionary maps an integer flag to the corresponding potential class.
 # To add a new potential, define its class and then add an
@@ -675,27 +896,37 @@ potential_factory: Dict[int, Type[ScalarPotential]] = {
         1: ConstantPotential,
         2: ExponentialPotential,
         3: PowerLawPotential,
-        4: GaussianPotential, # Placeholder for future implementation 
+        4: GaussianPotential,
+        5: InversePowerLawPotential 
     }
 
 if __name__ == '__main__':
 
     #Flags to display simulations
     PLOT_EQUATION_OF_STATE = True
-    PLOT_FIELD_EVOLUTION = False
+    PLOT_FIELD_EVOLUTION = True
     PLOT_BACKGROUND_EVOLUTION_SPECIES = False
     
     # --- Control Parameter Sweep ---
     # Set to a string like 'phi_i' or 'phi_prime_i' to activate sweep mode.
     # Set to None to run a single simulation.
-    sweep_parameter = 'phi_prime_i'
+    sweep_parameter = None
     sweep_values = [0, 1e1, 1e2, 1e3]
-    
+   
     # --- Set Initial Simulation Parameters ---
-    potential_flag = 1
-    # For flag=1, this would be: {'V0': True}, for flag=2, this would be (for example): {'A': True, 'B': -0.1}
-    # params_vector_to_shoot = {'V0': True} # Define which parameters are fixed and which one to solve for (True)
-    params_vector_to_shoot = {'V0': True} # bissection is not working properly here, need to check
+    potential_flag = 4
+
+    a_ini = 1e-4
+    a_end = 1.0
+    n_steps = 50000
+    phi_i_base = 10
+    phi_prime_i_base = 0.07*0
+
+    
+    # params_vector_to_shoot = {'A': True, 'B': 0.001} # This one is interesting for Inverse Power Law potential
+    # params_vector_to_shoot = {'A': True, 'B': -0.23} # This one is interesting for Exponential potential
+    params_vector_to_shoot = {'A': True, 'B': 1/phi_i_base**2, 'C': 0} # This one is interesting for Gaussian potential
+    # params_vector_to_shoot = {'V0': True} # bissection is not working properly here, need to check
 
     default_guesses = {
         'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # Standard guessses, we know it works
@@ -703,44 +934,37 @@ if __name__ == '__main__':
         'B':  [-1e5, 1e5],
         'C':  [1e-7, 1e-8]
     }
-
-    a_ini = 1e-4
-    a_end = 1.0
-    n_steps = 500000
-    phi_i_base = 10.0
-    phi_prime_i_base = 2e1
-    
-    """
-    # There is a curious phantom crossing for these parameters
-        params_vector_to_shoot = {'A': True, 'B': -0.23} 
-
-    default_guesses = {
-        'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # Standard guessses, we know it works
-        'A':  [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # For exponential potential: A = [1e-7, 1e-8], B = [-0.05, 0.05], these usually work for secant method
-        'B':  [-0.05, 0.05],
-        'C':  [1e-7, 1e-8]
-    }
-    """
     
     # --- Main Execution Logic: Single Run vs. Parameter Sweep ---
     if sweep_parameter is None:
         # --- Single Simulation Run ---
-        if PLOT_EQUATION_OF_STATE:
-            try:
-                # Prepare a dictionary of the base parameters
-                sim_params = {
-                    'potential_flag': potential_flag,
-                    'params_vector_to_shoot': params_vector_to_shoot,
-                    'a_ini': a_ini, 'a_end': a_end, 'n_steps': n_steps,
-                    'phi_i': phi_i_base, 'phi_prime_i': phi_prime_i_base,
-                    'default_guesses': default_guesses
-                }
-                results = run_full_simulation(**sim_params)
-                print("\n--- Final Converged Solution & Results ---")
-                print(f"Final Potential: {results['potential_object']}")
-                plot_eos_eff(results, use_redshift=True, show_phantom_phase=True, xlim=[0, 50], ylim=[-1.5, 1.2])
-            except (RuntimeError, NotImplementedError, ValueError) as e:
-                logging.error(f"Single simulation failed: {e}")
+        try:
+            results = run_full_simulation(
+                potential_flag=potential_flag,
+                params_vector_to_shoot=params_vector_to_shoot,
+                a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+                phi_i=phi_i_base, phi_prime_i=phi_prime_i_base,
+                default_guesses=default_guesses
+            )
+
+            print("\n--- Final Converged Solution & Results ---")
+            print(f"Final Potential: {results['potential_object']}")
+            
+            if PLOT_EQUATION_OF_STATE:
+                plot_eos_eff(results, 
+                             use_redshift=True, 
+                             show_phantom_phase=True, 
+                             xlim=[0, 5], ylim=[-1.5, -0.6], 
+                             plot_potential_together=True, 
+                             plot_effective_potential=False,
+                             plot_field_evolution=PLOT_FIELD_EVOLUTION,
+                             show_V_x_phi=False)
+            
+            if PLOT_BACKGROUND_EVOLUTION_SPECIES:
+                plot_background_species(results, compare_with_LCDM=True)
+
+        except (RuntimeError, NotImplementedError, ValueError) as e:
+            logging.error(f"Single simulation failed: {e}")
     else:
         # --- Parameter Sweep Run ---
         logging.info(f"--- Starting Parameter Sweep for '{sweep_parameter}' ---")
@@ -767,5 +991,4 @@ if __name__ == '__main__':
         
         # After all simulations are done, plot the combined results
         if all_results:
-            plot_sweep_results(all_results, sweep_parameter, use_redshift=True, x_lim=[0, 150], y_lim=[-2.5, 2.2])
-
+            plot_sweep_results(all_results, sweep_parameter, use_redshift=True)
