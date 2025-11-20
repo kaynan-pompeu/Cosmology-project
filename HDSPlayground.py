@@ -19,7 +19,10 @@ omega_de = 1 - omega_c - omega_b - omega_r
 omega_de_target = omega_de
 omega_c_target = omega_c
 
-global_alpha=1
+# -- DESI central values ---
+w0_desi = -0.727
+wa_desi = -1.05
+global_alpha = 1
 
 from HDSSolver import global_alpha, find_all_phantom_crossings, find_w_phi_critical_points, run_full_simulation
 
@@ -248,7 +251,7 @@ def plot_sweep_results(results_list: List[Dict[str, Any]],
         if len(parts) == 2 and parts[0] == 'phi' and parts[1] == 'i':
             latex_name = r"\phi_i"
         elif len(parts) == 3 and parts[0] == 'phi' and parts[1] == 'prime' and parts[2] == 'i':
-            latex_name = r"\phi'_i"
+            latex_name = r"\phi'_i]"
         elif len(parts) == 2:
              latex_name = fr"\{parts[0]}_{{{parts[1]}}}"
         else:
@@ -739,6 +742,225 @@ def analysis_phantom_phase(
 
     plt.show()
 
+def plot_fields_and_derivatives(results: Dict[str, Any], 
+                                use_redshift: bool = False,
+                                show_phantom_phase: bool = True,
+                                show_initial_parameters: bool = True,
+                                is_log_x: bool = True,
+                                is_log_y: list = [True, True, True]) -> None:
+    """
+    Plots the scalar field (phi), its first derivative (phi'), 
+    and its second derivative (phi'') in a 3-panel plot.
+    """
+    logging.info("--- Plotting Field and Derivative Evolution ---")
+    
+    # --- Create Figure ---
+    # 3 panels, stacked vertically, sharing the x-axis
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    fig.subplots_adjust(hspace=0.08) # Reduce vertical space
+
+    # --- Setup X-axis ---
+    if use_redshift:
+        x_data = 1 / results['a'] - 1
+        xlabel = "Redshift (z)"
+        ax1.invert_xaxis() # This will apply to all shared axes
+        if is_log_x:
+            ax1.set_xscale('log')
+    else:
+        x_data = results['a']
+        xlabel = "Scale Factor (a)"
+        if is_log_x:
+            ax1.set_xscale('log') # This will apply to all shared axes
+
+    # --- Get Data Arrays from Results ---
+    a = results['a']
+    phi = results['phi']
+    phi_prime = results['phi_prime']
+    H_curly = results['H_curly']
+    rho_dm = results['rho_dm']
+    potential_object = results['potential_object']
+    
+    # --- Calculate phi'' (Second Conformal Time Derivative) ---
+    # We use the Klein-Gordon equation:
+    # phi'' = -2*H_curly*phi' - a^2*(dV/dphi) - a^2*(rho_dm*alpha/phi)
+    
+    # Get dV/dphi, ensuring it's an array
+    dV_dphi_val = potential_object.derivative(phi)
+    if np.isscalar(dV_dphi_val):
+        dV_dphi_arr = np.full_like(phi, dV_dphi_val)
+    else:
+        dV_dphi_arr = dV_dphi_val
+
+    # Safety checks for division by zero
+    epsilon = 1e-40
+    phi_safe = np.where(np.abs(phi) < epsilon, epsilon, phi)
+    H_curly_safe = np.where(np.abs(H_curly) < epsilon, epsilon, H_curly)
+
+    # Calculate the three terms of the equation
+    term1 = -2 * H_curly_safe * phi_prime       # Hubble friction
+    term2 = -a**2 * dV_dphi_arr                  # Potential force
+    term3 = -a**2 * rho_dm * global_alpha / phi_safe # Coupling force
+    
+    phi_double_prime = term1 + term2 + term3
+
+    phi_double_dot = (phi_double_prime / a**2) - (H_curly_safe * phi_prime / a**2)
+    phi_dot = phi_prime / a
+
+    # --- Panel 1: Field Evolution (phi) ---
+    ax1.plot(x_data, phi, color='blue', label=r'$\phi$')
+    ax1.set_ylabel(r'$\phi$')
+    ax1.set_title('Scalar Field Evolution')
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+    if is_log_y[0]:
+        ax1.set_yscale('symlog', linthresh=1e-10)
+
+    # --- Panel 2: First Derivative (phi') ---
+    ax2.plot(x_data, phi_dot, color='green', label=r"$\phi'$")
+    ax2.set_ylabel(r"$\dot{\phi} ~ [Mpc^{-1}]$")
+    ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+    if is_log_y[1]:
+        ax2.set_yscale('symlog', linthresh=1e-10)
+
+    # --- Panel 3: Second Derivative (phi'') ---
+    ax3.plot(x_data, phi_double_dot, color='purple', label=r"$\phi''$")
+    ax3.set_ylabel(r"$\ddot{\phi} ~ [Mpc^{-2}]$")
+    ax3.set_xlabel(xlabel) # Only on the bottom plot
+    ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+    if is_log_y[2]:
+        ax3.set_yscale('symlog', linthresh=1e-9)
+    
+    # --- Apply Phantom Phase Shading to all panels ---
+    if show_phantom_phase:
+        is_phantom = results['w_eff'] < -1
+        phantom_boundaries = np.diff(np.concatenate(([False], is_phantom, [False])).astype(int))
+        start_indices = np.where(phantom_boundaries == 1)[0]
+        end_indices = np.where(phantom_boundaries == -1)[0]
+        
+        has_phantom_label = False
+        for start_idx, end_idx in zip(start_indices, end_indices):
+            label = 'Phantom Phase' if not has_phantom_label else ''
+            if start_idx < len(x_data) and end_idx <= len(x_data):
+                # Shade all three axes
+                ax1.axvspan(x_data[start_idx], x_data[end_idx - 1], color='red', alpha=0.2, label=label)
+                ax2.axvspan(x_data[start_idx], x_data[end_idx - 1], color='red', alpha=0.2)
+                ax3.axvspan(x_data[start_idx], x_data[end_idx - 1], color='red', alpha=0.2)
+                has_phantom_label = True
+
+    # --- Final Legend Handling (add to top plot) ---
+    handles, labels = ax1.get_legend_handles_labels()
+    if show_initial_parameters:
+        ic = results['initial_conditions']
+        ic_text = (
+            f"Initial Conditions:\n"
+            fr"  $a_i = {ic['a_ini']:.1e}$"
+            fr", $\phi_i = {ic['phi_i']:.2f}$"
+            fr", $\phi'_i = {ic['phi_prime_i']:.2e}$"
+            fr", $\alpha={global_alpha}$"
+        )
+        extra = Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', linewidth=0)
+        handles.append(extra)
+        labels.append(ic_text)
+        print(results['potential_object'])
+    
+    ax1.legend(handles, labels, loc='best', fontsize='small', bbox_to_anchor=(1, 0.5))
+    ax2.legend(loc='best', fontsize='small')
+    ax3.legend(loc='best', fontsize='small')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
+    plt.show()
+
+def plot_klein_gordon_terms(results: Dict[str, Any], 
+                            use_redshift: bool = False, 
+                            show_phantom_phase: bool = True,
+                            show_initial_parameters: bool = True) -> None:
+    """
+    Plots the individual terms of the Klein-Gordon equation for the scalar field.
+    """
+    logging.info("--- Plotting Klein-Gordon Equation Terms ---")
+    
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+
+    # --- Setup X-axis ---
+    if use_redshift:
+        x_data = 1 / results['a'] - 1
+        xlabel = "Redshift (z)"
+        ax1.invert_xaxis()
+        ax1.set_xscale('log')
+    else:
+        x_data = results['a']
+        xlabel = "Scale Factor (a)"
+        ax1.set_xscale('log')
+
+    # --- Calculate Terms ---
+    a = results['a']
+    phi = results['phi']
+    phi_prime = results['phi_prime']
+    H_curly = results['H_curly']
+    rho_dm = results['rho_dm']
+    potential_object = results['potential_object']
+
+    dV_dphi_val = potential_object.derivative(phi)
+    if np.isscalar(dV_dphi_val):
+        dV_dphi_arr = np.full_like(phi, dV_dphi_val)
+    else:
+        dV_dphi_arr = dV_dphi_val
+
+    epsilon = 1e-40
+    phi_safe = np.where(np.abs(phi) < epsilon, epsilon, phi)
+    H_curly_safe = np.where(np.abs(H_curly) < epsilon, epsilon, H_curly)
+
+    term1 = -2 * H_curly_safe * phi_prime       # Hubble friction
+    term2 = -a**2 * dV_dphi_arr                  # Potential force
+    term3 = -a**2 * rho_dm * global_alpha / phi_safe # Coupling force
+    
+    phi_double_prime = term1 + term2 + term3
+
+    phi_double_dot = (phi_double_prime / a**2) - (H_curly_safe * phi_prime / a**2)
+    phi_dot = phi_prime / a
+    hubble_fric = 3 * (H_curly_safe / a) * phi_dot
+    pot_force = -dV_dphi_arr
+    coupling_force = -global_alpha * rho_dm / phi_safe
+
+
+    # --- Plot Terms ---
+    ax1.plot(x_data, hubble_fric, label=r"Hubble Friction ($-3H \dot{phi}$)", color='blue', linestyle='--')
+    ax1.plot(x_data, pot_force, label=r'Potential Force ($-V_{,\phi}$)', color='green', linestyle=':')
+    ax1.plot(x_data, coupling_force, label=r'Coupling Force (-$\alpha \rho_{dm}/\phi$)', color='red', linestyle='-.')
+    ax1.plot(x_data, phi_double_dot, label=r"Field acceleration: $\ddot{\phi}~~[Mpc^-2]$", color='black', linestyle='-')
+
+
+    # --- Add Phantom Phase Shading ---
+    if show_phantom_phase:
+        # Use transform=ax1.get_xaxis_transform() to fill vertically
+        ax1.fill_between(x_data, 0, 1, where=results['w_eff'] < -1, 
+                         facecolor='red', alpha=0.1, transform=ax1.get_xaxis_transform(), 
+                         label='Phantom Phase ($w_{eff} < -1$)')
+
+    ax1.set_xlabel(xlabel)
+    ax1.set_ylabel(r'Klein-Gordon Terms') # Units are complex
+    ax1.set_yscale('symlog', linthresh=1e-10) # Use symlog for positive/negative values
+    ax1.set_title('Klein-Gordon Equation Terms Evolution')
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # --- Legend Handling ---
+    handles, labels = ax1.get_legend_handles_labels()
+    if show_initial_parameters:
+        ic = results['initial_conditions']
+        ic_text = (
+            f"Initial Conditions:\n"
+            fr"  $a_i = {ic['a_ini']:.1e}$"
+            fr", $\phi_i = {ic['phi_i']:.2f}$"
+            fr", $\phi'_i = {ic['phi_prime_i']:.2e}$"
+            fr", $\alpha={global_alpha}$"
+            f"\nPotential:\n"
+            f"  {results['potential_object']}"
+        )
+        extra = Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', linewidth=0)
+        handles.append(extra)
+        labels.append(ic_text)
+
+    ax1.legend(handles, labels, loc='lower right', fontsize='small')
+    fig.subplots_adjust(right=0.75) # Make room for legend
 
 if __name__ == '__main__':
 
@@ -748,24 +970,27 @@ if __name__ == '__main__':
     PLOT_BACKGROUND_EVOLUTION_SPECIES = False
     PLOT_ENERGIES_RATIO = False
     PLOT_COMPARISON_OF_POTENTIALS = False
-    PLOT_PHANTOM_PHASE_ANALYSIS = True
+    PLOT_PHANTOM_PHASE_ANALYSIS = False
+    PLOT_FIELDS_AND_DERIVATIVES = True
     
     # --- Control Parameter Sweep ---
     # Set to a string like 'phi_i' or 'phi_prime_i' to activate sweep mode.
     # Set to None to run a single simulation.
-    sweep_parameter = 'phi_prime_i'
+    sweep_parameter = None
     sweep_values = [0, 1e1, 1e2, 500]
    
     # --- Set Initial Simulation Parameters ---
-    potential_flag = 1
+    potential_flag = 6
 
     initial_conditions = {
         'a_ini': 1e-5,
         'a_end': 1.0,
-        'n_steps': 50000,
+        'n_steps': 500000,
         'phi_i': 20,
-        'phi_prime_i': 120
+        'phi_prime_i': 0.0
     }
+
+    #Very weird stuff happening at high redshift, there is probably a mistake on the implementation of the second derivative of the field.
 
     default_guesses = {
         'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # Standard guessses, we know it works
@@ -780,13 +1005,17 @@ if __name__ == '__main__':
     phi_i_base = initial_conditions['phi_i']
     phi_prime_i_base = initial_conditions['phi_prime_i']
 
-    # params_vector_to_shoot = {'A': True, 'B': -0.23} # This one is interesting for Exponential potential
+    # params_vector_to_shoot = {'A': True, 'B': -0.09} # This one is interesting for Exponential potential
     # params_vector_to_shoot = {'A': True, 'B': 1/phi_i_base**2, 'C':phi_i_base/10} # This one is interesting for Gaussian potential
-    params_vector_to_shoot = {'V0': True} # bissection is not working properly here, need to check
-    # params_vector_to_shoot = {'V0': True, 'A': 8.59, 'B': phi_i_base-1.1}
+    # params_vector_to_shoot = {'V0': True} # bissection is not working properly here, need to check
+    # params_vector_to_shoot = {'A': True, 'B':  4} # This one is interesting for Power law, \lambda\phi^4 seems to not work well
+    params_vector_to_shoot = {'V0': True, 'A': 19.37, 'B': 19.41}
 
+    #c=19.3
+    #params_vector_to_shoot = {'A': True, 'B': 0.6, 'C':c}
+    
     eps = 1
-    # params_vector_to_shoot = {'V0': True, 'A': phi_i_base, 'B': phi_i_base/2, 'C': -1} # tanh
+    #params_vector_to_shoot = {'V0': True, 'A': phi_i_base, 'B': phi_i_base/2, 'C': -1} # tanh
     
     # --- Main Execution Logic: Single Run vs. Parameter Sweep ---
     if PLOT_PHANTOM_PHASE_ANALYSIS:
@@ -892,10 +1121,10 @@ if __name__ == '__main__':
                     plot_eos_eff(results, 
                                 use_redshift=True, 
                                 show_phantom_phase=True, 
-                                xlim=[0, 80], ylim=[-1.6, 1.0], 
+                                xlim=[0, 6], ylim=[-1.8, 1.2], 
                                 plot_potential_together=False, 
                                 plot_effective_potential=False,
-                                plot_field_evolution=False,
+                                plot_field_evolution=PLOT_FIELD_EVOLUTION,
                                 show_ratio_phi_prime_over_phi=False,
                                 )
                 
@@ -907,6 +1136,10 @@ if __name__ == '__main__':
                                 use_redshift=True, 
                                 show_phantom_phase=True,
                                 )
+                if PLOT_FIELDS_AND_DERIVATIVES:
+                    plot_klein_gordon_terms(results, use_redshift=True)
+                    plot_fields_and_derivatives(results, use_redshift=True, show_phantom_phase=True, is_log_y=[False, True, True])
+
                 plt.show()
 
         except (RuntimeError, NotImplementedError, ValueError) as e:
@@ -938,5 +1171,5 @@ if __name__ == '__main__':
             
             # After all simulations are done, plot the combined results
             if all_results:
-                plot_sweep_results(all_results, sweep_parameter, use_redshift=False, x_lim=[1, 0.0001], y_lim=[-1.6, 1.0])
+                plot_sweep_results(all_results, sweep_parameter, use_redshift=False, x_lim=[1, 0.0001], y_lim=[-2.0, 2.0])
                 plt.show()
