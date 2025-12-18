@@ -1,0 +1,395 @@
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+import numpy as np
+import logging
+from typing import List, Dict, Any, Optional
+
+# --- Fixed cosmological parameters from Planck 2018 ---
+# --- Using CAMB units ---
+c_in_km_s = 299_792.458
+h = 0.6756
+H0 = 100*h/c_in_km_s
+rho_cr = 3*H0**2
+omega_c = 0.12/h**2
+omega_b = 0.022/h**2
+omega_phot = 2.47e-5/h**2
+omega_massless_nu = 3*(7/8)*(4/11)**(4/3)*omega_phot
+omega_r = omega_phot + omega_massless_nu
+omega_de = 1 - omega_c - omega_b - omega_r
+omega_de_target = omega_de
+omega_c_target = omega_c
+
+# -- DESI central values ---
+w0_desi = -0.727
+wa_desi = -1.05
+global_alpha = 1
+
+from HDSSolver import global_alpha, find_all_phantom_crossings, find_w_phi_critical_points, run_full_simulation
+
+def plot_eos_eff(results: Dict[str, Any], 
+                 show_eos=True,
+                 show_critical_points=True,
+                 xlim: Optional[List[float]] = None,
+                 ylim: Optional[List[float]] = None,
+                 use_redshift=False,
+                 show_initial_parameters=True,
+                 show_phantom_phase=True,
+                 potentials=Optional[Dict[str, Any]]
+                ) -> None:
+    """
+    Plots the effective equation of state and, optionally, other diagnostic plots.
+    """
+    logging.info("--- Plotting Results ---")
+    
+    # --- Setup Figure: Determine number of panels ---
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    
+    # --- Setup X-axis for time-evolution plots ---
+    if use_redshift:
+        x_data = 1 / results['a'] - 1
+        xlabel = "Redshift (z)"
+        ax1.invert_xaxis()
+    else:
+        x_data = results['a']
+        xlabel = "Scale Factor (a)"
+
+    if show_eos:
+        ax1.plot(x_data, results['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
+        ax1.plot(x_data, results['w_eff'], label=r'$w_{eff}$ (DE + Interaction)', color='black')
+        if show_phantom_phase:
+                ax1.fill_between(x_data, results['w_eff'], -1, where=results['w_eff'] < -1, 
+                         color='red', alpha=0.2, label='Phantom Phase')
+    ax1.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
+
+    if xlim: ax1.set_xlim(xlim)
+    if ylim: ax1.set_ylim(ylim)
+    else: ax1.set_ylim(-1.5, 1.2)
+
+    ax1.set_xlabel(xlabel)
+    ax1.set_ylabel("Equation of State (w)")
+    ax1.set_title(f"Equation of State Evolution")
+    if not use_redshift: ax1.set_xscale('log')
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+     # --- Legend Handling ---
+    handles, labels = ax1.get_legend_handles_labels()
+    if show_initial_parameters:
+        ic = results['initial_conditions']
+        ic_text = (
+            f"Initial Conditions:\n"
+            fr"$a_i = {ic['a_ini']:.1e}$"
+            f"\n"
+            fr"$\phi_i = {ic['phi_i']}$"
+            f"\n"
+            fr"$\phi'_i = {ic['phi_prime_i']} [Mpc^{-1}]$"
+            f"\n"
+            fr"$\alpha={global_alpha}$"
+        )
+        extra = Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', linewidth=0)
+        handles.append(extra)
+        labels.append(ic_text)
+
+def plot_multi_eos(results_list: List[Dict[str, Any]], 
+                   xlim: Optional[List[float]] = None,
+                   ylim: Optional[List[float]] = None,
+                   use_redshift=True) -> None:
+    
+    logging.info("--- Plotting Multi-Potential Comparison ---")
+    fig, ax1 = plt.subplots(figsize=(12, 8))
+    
+    # Professional color palette
+    colors = plt.cm.tab10(np.linspace(0, 1, len(results_list)))
+    
+    # Containers for the two legends
+    potential_handles = []
+    global_handles = []
+
+    # 1. Prepare Global Legend (Lower Right)
+    ic_glob = results_list[0]['initial_conditions']
+    global_text = (fr"$\bf{{Global\ Parameters:}}$" + "\n" + 
+                   f"$a_i={ic_glob['a_ini']:.1e}$\n" + 
+                   fr"$\alpha={global_alpha}$")
+    
+    global_handles.append(Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', label=global_text))
+    global_handles.append(Line2D([0], [0], color='black', lw=2, label=r'$w_{eff}$ (Total)'))
+    global_handles.append(Line2D([0], [0], color='black', lw=1.5, ls='--', label=r'$w_{\phi}$ (Field)'))
+
+    # 2. Plot Data and Prepare Potential Legend (Upper Right)
+    for i, res in enumerate(results_list):
+        color = colors[i]
+        x_data = 1 / res['a'] - 1 if use_redshift else res['a']
+        
+        ax1.plot(x_data, res['w_phi'], color=color, linestyle='--', alpha=0.6, lw=1.5)
+        ax1.plot(x_data, res['w_eff'], color=color, linestyle='-', alpha=1.0, lw=2.5)
+
+        pot_obj = res['potential_object']
+        ic = res['initial_conditions']
+        
+        # Multiline label: Potential Eq + Params + ICs
+        full_label = (pot_obj.to_latex() + "\n" + 
+                      fr"ICs: $(\phi_i={ic['phi_i']}, \phi'_i={ic['phi_prime_i']})$")
+        
+        potential_handles.append(Line2D([0], [0], color=color, lw=4, label=full_label))
+
+    # Cosmological reference lines
+    ax1.axhline(-1, color='red', linestyle=':', alpha=0.8, label='Phantom Divide ($w=-1$)')
+    ax1.axhline(0, color='gray', linestyle='-', alpha=0.3, lw=1) # Matter line for reference
+
+    # Axis Formatting
+    if use_redshift:
+        ax1.set_xlabel("Redshift ($z$)", fontsize=12)
+        ax1.invert_xaxis()
+    else:
+        ax1.set_xlabel("Scale Factor ($a$)", fontsize=12)
+        ax1.set_xscale('log')
+
+    ax1.set_ylabel("Equation of State ($w$)", fontsize=12)
+    ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+    
+    if xlim: ax1.set_xlim(xlim)
+    if ylim: ax1.set_ylim(ylim)
+
+    # --- Legend 1: Potentials (Upper Right) ---
+    leg1 = ax1.legend(handles=potential_handles, 
+                      loc='upper right', 
+                      fontsize=9, 
+                      labelspacing=1.3, 
+                      framealpha=0.9, 
+                      edgecolor='black',
+                      title=r"$\bf{Potential\ Models}$")
+    
+    # --- Legend 2: Global & Styles (Lower Right) ---
+    # We must add this manually to the axes so it doesn't remove Legend 1
+    leg2 = ax1.legend(handles=global_handles, 
+                      loc='lower right', 
+                      fontsize=9, 
+                      labelspacing=0.8,
+                      framealpha=0.9, 
+                      edgecolor='black')
+    
+    ax1.add_artist(leg1) # Re-add the first legend
+    
+    plt.tight_layout()
+
+def plot_multi_normalized_twin(results_list: List[Dict[str, Any]],
+                               xlim: Optional[List[float]] = None,
+                               use_redshift: bool = True,
+                               is_log_x: bool = True,
+                               show_phantom_phase: bool = True) -> None:
+    """
+    Plots normalized Field (phi/phi_i) and normalized Potential (V/V_i)
+    with model-specific phantom phase shading.
+    """
+    logging.info("--- Plotting Normalized Field and Potential Twin-Axis ---")
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10), sharex=True)
+    axt1 = ax1.twinx()
+    axt2 = ax2.twinx()
+
+    # Use a distinct color cycle
+    colors = plt.cm.tab10(np.linspace(0, 1, len(results_list)))
+    
+    potential_handles = []
+    global_handles = []
+
+    # 1. Global Legend Preparation (Lower Right)
+    ic_glob = results_list[0]['initial_conditions']
+    global_text = (fr"$\bf{{Global\ Parameters:}}$" + "\n" + 
+                   f"$a_i={ic_glob['a_ini']:.1e}$\n" + 
+                   fr"$\alpha={global_alpha}$")
+    
+    global_handles.append(Rectangle((0, 0), 1, 1, fc="w", fill=False, edgecolor='none', label=global_text))
+    global_handles.append(Line2D([0], [0], color='black', lw=2, label=r'Solid: $\phi/\phi_i$ (Left)'))
+    global_handles.append(Line2D([0], [0], color='black', lw=1.5, ls='--', label=r'Dashed: $V/V_i$ (Right)'))
+    
+    if show_phantom_phase:
+        global_handles.append(Rectangle((0, 0), 1, 1, fc="gray", alpha=0.2, label='Colored Shading: Phantom Phase'))
+
+    # 2. Plotting Loop
+    for i, res in enumerate(results_list):
+        color = colors[i]
+        phi = res['phi']
+        a = res['a']
+        pot_obj = res['potential_object']
+        
+        # Calculate Potential and Initial Values for Normalization
+        v_vals = np.array([pot_obj.value(p) for p in phi])
+        phi_i = res['initial_conditions']['phi_i']
+        v_i = v_vals[0]
+        
+        # Normalization
+        phi_norm = phi / phi_i
+        v_norm = v_vals / v_i
+        
+        x_data = 1 / a - 1 if use_redshift else a
+
+        # --- Plot Normalized Field (Left Axis) ---
+        if i==0:
+            ax1.plot(x_data, phi_norm, color=color, linestyle='-', lw=2.5, alpha=0.9)
+            
+            # --- Plot Normalized Potential (Right Axis) ---
+            axt1.plot(x_data, v_norm, color=color, linestyle='--', lw=1.5, alpha=0.7)
+
+            # --- Model-Specific Phantom Shading ---
+            if show_phantom_phase and 'w_eff' in res:
+                is_phantom = res['w_eff'] < -1
+                diff = np.diff(np.concatenate(([0], is_phantom.astype(int), [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0]
+                for s, e in zip(starts, ends):
+                    # Use a very light alpha because regions might overlap
+                    ax1.axvspan(x_data[s], x_data[e-1], color=color, alpha=0.22)
+        else:
+            ax2.plot(x_data, phi_norm, color=color, linestyle='-', lw=2.5, alpha=0.9)
+            
+            # --- Plot Normalized Potential (Right Axis) ---
+            axt2.plot(x_data, v_norm, color=color, linestyle='--', lw=1.5, alpha=0.7)
+
+            # --- Model-Specific Phantom Shading ---
+            if show_phantom_phase and 'w_eff' in res:
+                is_phantom = res['w_eff'] < -1
+                diff = np.diff(np.concatenate(([0], is_phantom.astype(int), [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0]
+                for s, e in zip(starts, ends):
+                    # Use a very light alpha because regions might overlap
+                    ax2.axvspan(x_data[s], x_data[e-1], color=color, alpha=0.22)
+
+        # Potential Legend Entry
+        ic = res['initial_conditions']
+        full_label = (pot_obj.to_latex() + "\n" + 
+                      fr"ICs: $(\phi_i={ic['phi_i']}, \phi'_i={ic['phi_prime_i']:.1e})$")
+        potential_handles.append(Line2D([0], [0], color=color, lw=4, label=full_label))
+
+    # Axis Labels and Formatting
+    ax1.set_ylabel(r"Normalized Field $\phi / \phi_i$", fontsize=12, fontweight='bold')
+    axt1.set_ylabel(r"Normalized Potential $V(\phi) / V_i$", fontsize=12, fontweight='bold', rotation=270, labelpad=25)
+    ax2.set_ylabel(r"Normalized Field $\phi / \phi_i$", fontsize=12, fontweight='bold')
+    axt2.set_ylabel(r"Normalized Potential $V(\phi) / V_i$", fontsize=12, fontweight='bold', rotation=270, labelpad=25)
+    
+    ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+    ax2.grid(True, which='both', linestyle='--', alpha=0.3)
+    
+    if is_log_x: 
+        ax1.set_xscale('log')
+        ax2.set_xscale('log')
+    if use_redshift:
+        ax1.set_xlabel("Redshift ($z$)", fontsize=12)
+        ax1.invert_xaxis()
+        ax2.set_xlabel("Redshift ($z$)", fontsize=12)
+        ax2.invert_xaxis()
+    else:
+        ax1.set_xlabel("Scale Factor ($a$)", fontsize=12)
+        ax2.set_xlabel("Scale Factor ($a$)", fontsize=12)
+
+    if xlim: 
+        ax1.set_xlim(xlim)
+        ax2.set_xlim(xlim)
+
+    # --- Re-implementing the dual legend design ---
+    leg1 = ax1.legend(handles=potential_handles, loc='lower right', fontsize=8.5, 
+                      labelspacing=1.3, framealpha=0.95, edgecolor='black', 
+                      title=r"$\bf{Normalized\ Models}$")
+    
+    leg2 = ax1.legend(handles=global_handles, loc='lower left', fontsize=9, 
+                      framealpha=0.95, edgecolor='black')
+    
+    ax1.add_artist(leg1)
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == '__main__':
+    #Flags to display simulations
+    PLOT_EQUATION_OF_STATE = True
+    PLOT_FIELDS_AND_DERIVATIVES = True
+   
+    # --- Set Initial Simulation Parameters for single run ---
+    potential_flag = 1
+    initial_conditions = {
+        'a_ini': 1e-5,
+        'a_end': 1.0,
+        'n_steps': 50000,
+        'phi_i': 10,
+        'phi_prime_i': 650
+    }
+    default_guesses = {
+        'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # Standard guessses, we know it works
+        'A':  [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2], # For exponential potential: A = [1e-7, 1e-8], B = [-0.05, 0.05], these usually work for secant method
+        'B':  [-1e5, 1e5],
+        'C':  [1e-7, 1e-8]
+    }
+    a_ini = initial_conditions['a_ini']
+    a_end = initial_conditions['a_end']
+    n_steps = initial_conditions['n_steps']
+    phi_i_base = initial_conditions['phi_i']
+    phi_prime_i_base = initial_conditions['phi_prime_i']
+
+    params_vector_to_shoot = {'V0': True}
+
+    try:
+                results = run_full_simulation(
+                    potential_flag=potential_flag,
+                    params_vector_to_shoot=params_vector_to_shoot,
+                    a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+                    phi_i=phi_i_base, phi_prime_i=phi_prime_i_base,
+                    default_guesses=default_guesses
+                )
+
+                print("\n--- Final Converged Solution & Results ---")
+                print(f"Final Potential: {results['potential_object']}")
+                print(results['phi'])
+                
+                if PLOT_EQUATION_OF_STATE:
+                    plot_eos_eff(results, 
+                                use_redshift=True, 
+                                show_phantom_phase=True,
+                                show_critical_points=False,
+                                xlim=[0, 30], ylim=[-1.8, 1.2]
+                                )
+
+                plt.show()
+
+    except Exception as e:
+        logging.error(f"An error occurred during the simulation: {e}")
+
+
+    # --- Set Initial Simulation Parameters for multiple runs ---
+    sim_configs = [
+        {
+            'flag': 1, 
+            'shoot': {'V0': True}, 
+            'ic': {'phi_i': 60, 'phi_prime_i': 650}
+        },
+        {
+            'flag': 4, 
+            'shoot': {'A': True, 'B': 4000/60**2, 'C':59.6}, 
+            'ic': {'phi_i': 60, 'phi_prime_i': 0.004}
+        }
+    ]
+
+    all_results = []
+    
+    for config in sim_configs:
+        print(f"\n>>> Simulating Potential Flag {config['flag']}...")
+        try:
+            res = run_full_simulation(
+                potential_flag=config['flag'],
+                params_vector_to_shoot=config['shoot'],
+                a_ini=1e-5, a_end=1.0, n_steps=50000,
+                phi_i=config['ic']['phi_i'],
+                phi_prime_i=config['ic']['phi_prime_i'],
+                default_guesses=default_guesses # Assumes globally defined as in your snippet
+            )
+            # Add metadata for the plotter
+            res['flag'] = config['flag']
+            all_results.append(res)
+        except Exception as e:
+            print(f"Error in sim {config['flag']}: {e}")
+
+    if all_results:
+        #plot_multi_eos(all_results, use_redshift=True, xlim=[10000, 0.1], ylim=[-1.5, 0.5])
+        plot_multi_normalized_twin(all_results, use_redshift=True, is_log_x=True, xlim=[15000, 0.1], show_phantom_phase=True)
+        plt.show()
