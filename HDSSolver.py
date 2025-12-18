@@ -4,7 +4,6 @@ import logging
 from typing import List, Tuple, Dict, Any
 from scipy.integrate import odeint, cumulative_trapezoid
 
-# Set up logging for better feedback
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # --- Fixed cosmological parameters from Planck 2018 ---
@@ -353,6 +352,12 @@ def calculate_derived_quantities(
         V_eff_integrated_sorted += V_of_phi[sort_indices][0] - V_eff_integrated_sorted[0]
         unsort_indices = np.argsort(sort_indices)
         V_eff_arr = V_eff_integrated_sorted[unsort_indices]
+    
+    phi_d_prime = -3*H_curly_arr * phi_prime_arr / a - a * dV_dphi_arr - a * interaction_force_arr
+
+    delta_rho_cdm = -rho_dm_arr[0]*(a[0]/a)**3 + rho_dm_arr
+
+    w_ds = w_phi / (1-delta_rho_cdm/rho_phi_arr) + 1/(1-rho_phi_arr/delta_rho_cdm) if np.all(delta_rho_cdm != 0) else w_phi
 
     return {
         "a": a,
@@ -369,7 +374,8 @@ def calculate_derived_quantities(
         "interaction": interaction,
         "coupling": coupling,
         "w_eff": w_eff,
-        "phi_prime_over_H_phi": phi_prime_over_H_phi
+        "phi_prime_over_H_phi": phi_prime_over_H_phi,
+        "w_ds": w_ds
     }
 
 def run_full_simulation(
