@@ -114,16 +114,16 @@ def find_present_day_fractions(result: np.ndarray, a_ini: float, rho_dm_i: float
 
 def integrate_cosmo(ic: List[float], a_ini: float, a_end: float, n_steps: int, rho_dm_i: float, potential_object: ScalarPotential) -> Tuple[np.ndarray, np.ndarray]:
     """Integrates the cosmological equations using a hybrid log/linear scale."""
-    frac, a_threshold = 0.4, 1e-3
+    frac, a_threshold = 0.4, 3e-4 # JVR EDIT: changed a_threshold for compatilibity with CAMB
     phi_i = ic[0]
-    n_steps_log = max(2, int(frac * n_steps))
+    n_steps_log = 2_000 # max(2, int(frac * n_steps)) # JVR EDIT: changed n_steps_log for compatibility with CAMB
     a_log = np.logspace(np.log10(a_ini), np.log10(a_threshold), n_steps_log)
     
     args_ode = (rho_dm_i, a_ini, phi_i, potential_object)
     result_log = odeint(equations_loga, ic, np.log(a_log), args=args_ode)
 
     ic_normal = result_log[-1]
-    n_steps_normal = max(2, n_steps - n_steps_log)
+    n_steps_normal = 10_000 # max(2, n_steps - n_steps_log) # JVR EDIT: changed n_steps_normal for compatibility with CAMB
     a_normal = np.linspace(a_threshold, a_end, n_steps_normal)
     result_normal = odeint(equations, ic_normal, a_normal, args=args_ode)
 
