@@ -1,16 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=cs2
+#SBATCH --job-name=<your job name>
 #SBATCH --time=4-00:00
-#SBATCH --partition=cosmoobs
-#SBATCH --output=./projects/cs2-project/logs/%x_%a_%A.out
-#SBATCH --error=./projects/cs2-project/logs/%x_%a_%A.err
+#SBATCH --partition=short,medium,long
+#SBATCH --output=./projects/<your output file>
+#SBATCH --error=./projects/<your log file>
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=5
-#SBATCH --mail-user=joao.reboucas@unesp.br
+#SBATCH --cpus-per-task=7
+#SBATCH --mail-user=<your grid email>
 #SBATCH --mail-type=ALL
 
-YAML=./projects/cs2-project/yamls/MCMC${SLURM_ARRAY_TASK_ID}.yaml
+YAML=./projects/hdstest/MCMC${SLURM_ARRAY_TASK_ID}.yaml # This is the path where the MCMC files must be. They must be numerated as MCMC1.yaml, MCMC2.yaml and so on. 
 
 echo "Job started in `hostname` at `date`"
 
@@ -18,9 +18,9 @@ echo "Job started in `hostname` at `date`"
 # This sleep prevents bugs from happening
 # sleep $(( 10 + SLURM_ARRAY_TASK_ID*20 ))
 
-cd ~/cocoa2/Cocoa
+cd ~/cocoa/Cocoa
 conda init bash
-conda activate cocoa2
+conda activate cocoa
 source start_cocoa.sh
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -32,6 +32,6 @@ export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-mpirun -n ${SLURM_NTASKS_PER_NODE} --mca btl tcp,self --bind-to core --map-by socket:PE=${OMP_NUM_THREADS} cobaya-run ${YAML} -r
+mpirun -n ${SLURM_NTASKS_PER_NODE} --mca btl tcp,self --bind-to core:overload-allowed --rank-by slot --map-by core cobaya-run ${YAML} -r
 
 echo "Job ended at `date`"
