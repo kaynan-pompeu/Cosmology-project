@@ -29,23 +29,26 @@ As_main, ns_main = 2.1e-9, 0.965
 # -- DESI central values ---
 w0_desi = -0.727
 wa_desi = -1.05
-global_alpha = 1
 
 # -- Global simulation parameters ---
+global_alpha = 1
 a_ini = 1e-5 # Fixed for CAMB 
 a_end = 1.0
 n_steps = 50000
-phi_i_base = 30.0
-phi_prime_i_base = 0
-default_guesses = {'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2]}
+phi_i_base = 10.5
+phi_prime_i_base = 0.28
+#default_guesses = {'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2]}
+potential_flag = 5 
+default_guesses = {'A':  [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2]}
+inverse_power = 9
 
 # -- Results from HDS (ODEINT-Based) --
 
 from HDSSolver import global_alpha, find_all_phantom_crossings, find_w_phi_critical_points, run_full_simulation
 
 results_HDS = run_full_simulation(
-                    potential_flag=1, # CAMB has only constant potential implemented
-                    params_vector_to_shoot={'V0': True},
+                    potential_flag=potential_flag, # CAMB inverse power law
+                    params_vector_to_shoot={'A': True, 'B': inverse_power},
                     a_ini=a_ini, a_end=a_end, n_steps=n_steps,
                     phi_i=phi_i_base, phi_prime_i=phi_prime_i_base,
                     default_guesses=default_guesses
@@ -55,7 +58,7 @@ results_HDS = run_full_simulation(
 params = camb.set_params(
         H0=100 * h_main, ombh2=omegabh2_main, omch2=omegach2_main, TCMB=2.7255,
         dark_energy_model='HybridQuintessence',
-        phi_i=phi_i_base, phi_prime_i=phi_prime_i_base, alpha=global_alpha,
+        phi_i=phi_i_base, phi_prime_i=phi_prime_i_base, alpha=global_alpha, potential_type=3, beta=inverse_power,
         omnuh2=0, num_nu_massless=3.044, num_nu_massive=0,
         nu_mass_degeneracies=[0], nu_mass_numbers=[0],
         As=As_main, ns=ns_main, tau=0.0544,
@@ -68,8 +71,10 @@ results_camb = camb.get_results(params)
 scale_factor_arr = results_HDS['a'] # using same array for both results
 
 rhos = results_camb.get_background_densities(scale_factor_arr)
-H = scale_factor_arr * results_camb.h_of_z(1 / scale_factor_arr - 1)
-H_curly = H * scale_factor_arr  # Conformal Hubble parameter
+#   H was set to a*H(z), and then H_curly was set to a*H again (=> a^2 H).
+#   h_of_z already returns H(z). Conformal Hubble is H_curly = a*H.
+H = results_camb.h_of_z(1 / scale_factor_arr - 1)
+H_curly = scale_factor_arr * H
 _, w_de = results_camb.get_dark_energy_rho_w(scale_factor_arr)
 rho_de = rhos['de']
 rho_cdm = rhos['cdm'] 
@@ -84,21 +89,21 @@ phi_interpolator = interp1d(de.sampled_a, de.phi_a, bounds_error=False, fill_val
 phi_prime_interpolator = interp1d(de.sampled_a, de.phidot_a, bounds_error=False, fill_value="extrapolate")
 
 phi = phi_interpolator(scale_factor_arr)
-phi_prime = phi_prime_interpolator(scale_factor_arr) # getting weird values here
+phi_prime = phi_prime_interpolator(scale_factor_arr)
 
-V_of_phi = np.full_like(phi, de.V0) # Only for constant potential
-dV_dphi_arr = np.zeros_like(phi) # Only for constant potential
-
-coupling_term = global_alpha * phi_prime * rho_cdm / (phi * 3 * H * rho_de)
-
+coupling_term = global_alpha * phi_prime * rho_cdm / (phi * 3 * H_curly * rho_de)
 w_eff = w_de + coupling_term
+#   delta_dm used physical-rho scaling (a^-3) on CAMB arrays that are in a^4*rho units.
+#   In a^4*rho units, the non-interacting CDM baseline scales as ~a.
+delta_dm = -rho_cdm[0] * (scale_factor_arr / scale_factor_arr[0]) + rho_cdm
+w_ds = w_de / (1-delta_dm/rho_de)
+
+# Legacy direct full-array prints removed in favor of structured comparison below.
 
 results_camb_dict = {
     'a': scale_factor_arr,
     'phi': phi,
     'phi_prime': phi_prime,
-    'V_of_phi': V_of_phi,
-    'dV_dphi': dV_dphi_arr,
     'rho_de': rho_de,
     'rho_cdm': rho_cdm,
     'rho_b': rho_b,
@@ -107,6 +112,7 @@ results_camb_dict = {
     'H_curly': H_curly,
     'w_phi': w_de,
     'w_eff': w_eff,
+    'w_ds': w_ds,
     'potential_object': 'Constant Potential (CAMB)',
     'initial_conditions': {
         'a_ini': a_ini,
@@ -115,87 +121,154 @@ results_camb_dict = {
     }
 }
 
+def compare_all_compatible_results(
+    results_camb: Dict[str, Any] = results_camb_dict,
+    results_hds: Dict[str, Any] = results_HDS,
+    top_n: int = 12
+) -> List[Dict[str, Any]]:
+    """
+    Compares all CAMB/HDS quantities that can be matched and ranks incompatibilities.
+    """
+    comparable_pairs = [
+        ('a', 'a'),
+        ('phi', 'phi'),
+        ('phi_prime', 'phi_prime'),
+        # BEFORE:
+        #   CAMB a^4*rho arrays were compared against HDS physical-rho arrays.
+        # WHY THIS CHANGE:
+        #   Compare in the same density convention to remove pure unit mismatch.
+        ('rho_de', 'rho_phi_a4'),
+        ('rho_cdm', 'rho_dm_a4'),
+        ('rho_b', 'rho_b_a4'),
+        ('rho_rad', 'rho_r_a4'),
+        ('H_curly', 'H_curly'),
+        ('w_phi', 'w_phi'),
+        ('w_eff', 'w_eff'),
+        ('w_ds', 'w_ds'),
+    ]
+
+    eps = 1e-30
+    rows: List[Dict[str, Any]] = []
+
+    print("\n=== CAMB vs HDS Comparable Results ===")
+    for camb_key, hds_key in comparable_pairs:
+        if camb_key not in results_camb:
+            print(f"[SKIP] CAMB missing key: {camb_key}")
+            continue
+        if hds_key not in results_hds:
+            print(f"[SKIP] HDS missing key: {hds_key}")
+            continue
+
+        camb_vals = np.asarray(results_camb[camb_key])
+        hds_vals = np.asarray(results_hds[hds_key])
+
+        if camb_vals.shape != hds_vals.shape:
+            print(f"[SKIP] {camb_key} <-> {hds_key}: shape mismatch {camb_vals.shape} vs {hds_vals.shape}")
+            continue
+        if not (np.issubdtype(camb_vals.dtype, np.number) and np.issubdtype(hds_vals.dtype, np.number)):
+            print(f"[SKIP] {camb_key} <-> {hds_key}: non-numeric")
+            continue
+
+        mask = np.isfinite(camb_vals) & np.isfinite(hds_vals)
+        if not np.any(mask):
+            print(f"[SKIP] {camb_key} <-> {hds_key}: no finite overlap")
+            continue
+
+        c = camb_vals[mask]
+        h = hds_vals[mask]
+        abs_diff = np.abs(h - c)
+        rel_diff = 100.0 * abs_diff / (np.abs(c) + eps)
+
+        mean_abs = float(np.mean(abs_diff))
+        max_abs = float(np.max(abs_diff))
+        mean_rel = float(np.mean(rel_diff))
+        p95_rel = float(np.percentile(rel_diff, 95))
+        max_rel = float(np.max(rel_diff))
+
+        # Heuristic score: persistent mismatch + tail mismatch.
+        score = mean_rel + 0.25 * p95_rel
+
+        rows.append({
+            'pair': f'{camb_key} <-> {hds_key}',
+            'mean_abs': mean_abs,
+            'max_abs': max_abs,
+            'mean_rel_pct': mean_rel,
+            'p95_rel_pct': p95_rel,
+            'max_rel_pct': max_rel,
+            'score': score,
+        })
+
+        n = min(3, c.size)
+        print(f"\n[{camb_key} <-> {hds_key}]")
+        print(f"  CAMB sample: {c[:n]}")
+        print(f"  HDS  sample: {h[:n]}")
+        print(
+            f"  mean|Δ|={mean_abs:.3e}, max|Δ|={max_abs:.3e}, "
+            f"mean rel={mean_rel:.3e}%, p95 rel={p95_rel:.3e}%, max rel={max_rel:.3e}%"
+        )
+
+    rows.sort(key=lambda r: r['score'], reverse=True)
+
+    print("\n=== Most Incompatible Pairs (ranked) ===")
+    if not rows:
+        print("No compatible numeric pairs found.")
+        return rows
+
+    for i, row in enumerate(rows[:top_n], start=1):
+        print(
+            f"{i:>2}. {row['pair']}: "
+            f"score={row['score']:.3e}, mean rel={row['mean_rel_pct']:.3e}%, "
+            f"p95 rel={row['p95_rel_pct']:.3e}%, max rel={row['max_rel_pct']:.3e}%"
+        )
+    return rows
+
 # -- Plotting --
 
 def compare_eos(results_camb: Dict[str, Any] = results_camb_dict,
                  results_hds: Dict[str, Any] = results_HDS, 
-                 show_phantom_crossings=True, 
-                 show_critical_points=True,
                  xlim: Optional[List[float]] = None,
                  ylim: Optional[List[float]] = None,
-                 use_redshift=False,
+                 use_redshift=True,
                  show_initial_parameters=True,
-                 show_phantom_redshifts=True,
-                 show_phantom_phase=True,
                  ) -> None:
     """
-    Plots the effective equation of state from both CAMB and HDS results for comparison.
+    Plots w_phi and w_ds from both CAMB and HDS on the same axes.
+    By default, uses redshift and xlim = [0, 3].
     """
     logging.info("--- Plotting Results ---")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7), sharey=True, sharex=True)
+    fig, ax = plt.subplots(figsize=(12, 7))
     
-    # --- Setup X-axis for time-evolution plots ---
     if use_redshift:
         x_data = 1 / results_hds['a'] - 1
         xlabel = "Redshift (z)"
-        ax1.invert_xaxis()
-        if ax2: ax2.invert_xaxis()
+        ax.invert_xaxis()
+        if xlim is None:
+            xlim = [0, 3]
     else:
         x_data = results_hds['a']
         xlabel = "Scale Factor (a)"
-    
-    ax1.plot(x_data, results_hds['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
-    ax1.plot(x_data, results_hds['w_eff'], label=r'$w_{eff}$', linestyle=':')
-    ax1.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
-    ax1.set_title('HDS Results')
 
-    ax2.plot(x_data, results_camb['w_phi'], label=r'$w_{\phi}$ (DE only)', linestyle=':')
-    ax2.plot(x_data, results_camb['w_eff'], label=r'$w_{eff}$', linestyle=':')
-    ax2.axhline(-1, color='red', linestyle='--', linewidth=1, label='Phantom Divide ($w=-1$)')
-    ax2.set_title('CAMB Results')
-
-    if show_phantom_phase:
-        ax1.fill_between(x_data, results_hds['w_eff'], -1, where=results_hds['w_eff'] < -1, 
-                         color='red', alpha=0.2, label='Phantom Phase')
-        ax2.fill_between(x_data, results_camb['w_eff'], -1, where=results_camb['w_eff'] < -1, 
-                         color='red', alpha=0.2, label='Phantom Phase')
-
-    if show_critical_points:
-        crit_indices = find_w_phi_critical_points(results_hds['w_phi'])
-        if len(crit_indices) > 0:
-            x_crit = x_data[crit_indices]
-            y_crit = results_hds['w_phi'][crit_indices]
-            ax1.scatter(x_crit, y_crit, marker='o', s=80, facecolors='none', edgecolors='green',
-                        zorder=5, label=r'Critical Points of $w_{\phi}$')
-        
-        crit_indices_camb = find_w_phi_critical_points(results_camb['w_phi'])
-        if len(crit_indices_camb) > 0:
-            x_crit_camb = x_data[crit_indices_camb]
-            y_crit_camb = results_camb['w_phi'][crit_indices_camb]
-            ax2.scatter(x_crit_camb, y_crit_camb, marker='o', s=80, facecolors='none', edgecolors='green',
-                        zorder=5, label=r'Critical Points of $w_{\phi}$')
+    ax.plot(x_data, results_hds['w_phi'], color='#1f77b4', linestyle='-', linewidth=2.0, label=r'HDS $w_{\phi}$')
+    ax.plot(x_data, results_hds['w_ds'], color='#1f77b4', linestyle='--', linewidth=2.0, label=r'HDS $w_{ds}$')
+    ax.plot(x_data, results_camb['w_phi'], color='#d62728', linestyle='-', linewidth=2.0, label=r'CAMB $w_{\phi}$')
+    ax.plot(x_data, results_camb['w_ds'], color='#d62728', linestyle='--', linewidth=2.0, label=r'CAMB $w_{ds}$')
+    ax.axhline(-1, color='black', linestyle=':', linewidth=1, alpha=0.8, label='Phantom Divide ($w=-1$)')
 
     if xlim: 
-        ax1.set_xlim(xlim)
-        ax2.set_xlim(xlim)
+        ax.set_xlim(xlim)
     if ylim: 
-        ax1.set_ylim(ylim)
-        ax2.set_ylim(ylim)
-    else: ax1.set_ylim(-1.5, 1.2)
+        ax.set_ylim(ylim)
+    else:
+        ax.set_ylim(-1.5, 1.2)
 
-    ax1.set_xlabel(xlabel)
-    ax1.set_ylabel("Equation of State (w)")
-    ax2.set_xlabel(xlabel)
-    ax2.set_ylabel("Equation of State (w)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Equation of State (w)")
 
     if not use_redshift: 
-        ax1.set_xscale('log')
-        ax2.set_xscale('log')
-    ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax.set_xscale('log')
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
 
-    # --- Legend Handling ---
-    handles, labels = ax1.get_legend_handles_labels()
+    handles, labels = ax.get_legend_handles_labels()
     if show_initial_parameters:
         ic = results_hds['initial_conditions']
         ic_text = (
@@ -212,10 +285,10 @@ def compare_eos(results_camb: Dict[str, Any] = results_camb_dict,
         handles.append(extra)
         labels.append(ic_text)
 
-    ax1.legend(handles, labels, loc='upper right', fontsize=9, framealpha=0.9)
+    ax.legend(handles, labels, loc='best', fontsize=9, framealpha=0.9)
 
-    plt.suptitle('Comparison of Dark Energy Equation of State: HDS vs CAMB', fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.title('Comparison of Dark Energy Equation of State: HDS vs CAMB', fontsize=14)
+    plt.tight_layout()
 
 def plot_relative_error(results_camb: Dict[str, Any],
                         results_hds: Dict[str, Any],
@@ -305,13 +378,13 @@ def plot_relative_error(results_camb: Dict[str, Any],
 def compare_results(results_camb: Dict[str, Any],
                     results_hds: Dict[str, Any], 
                     quantities: List[str] = ['w_phi', 'w_eff'],
-                    show_phantom_crossings=True, 
-                    show_critical_points=True,
+                    show_phantom_crossings=False, 
+                    show_critical_points=False,
                     xlim: Optional[List[float]] = None,
                     ylim: Optional[List[float]] = None,
                     use_redshift=False,
                     show_initial_parameters=True,
-                    show_phantom_phase=True,
+                    show_phantom_phase=False,
                     normalize_non_w: bool = True
                     ) -> None:
     """
@@ -470,10 +543,8 @@ def compare_results(results_camb: Dict[str, Any],
     plt.suptitle(f'Comparison: {", ".join(quantities)}', fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-#compare_eos()
+compare_eos(xlim=[0, 10])
 #plot_relative_error(results_camb_dict, results_HDS, quantities_to_compare=['w_eff', 'w_phi', 'phi', 'phi_prime'])
 #compare_results(results_camb_dict, results_HDS, quantities=['phi', 'phi_prime'], normalize_non_w=True)
-#plt.show()
-
-print(results_HDS['phi_prime'])
-print(results_camb_dict['phi_prime']) # there is a discrepancy on phi_prime
+plt.show()
+compare_all_compatible_results(results_camb_dict, results_HDS)
