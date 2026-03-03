@@ -19,16 +19,13 @@ omega_r = omega_phot + omega_massless_nu
 omega_de = 1 - omega_c - omega_b - omega_r
 omega_de_target = omega_de
 omega_c_target = omega_c
-
-# -- For Camb --
-import camb
-
-h_main, omegabh2_main, omegach2_main = 0.6756, 0.022, 0.120
-As_main, ns_main = 2.1e-9, 0.965
-
 # -- DESI central values ---
 w0_desi = -0.727
 wa_desi = -1.05
+
+import camb
+h_main, omegabh2_main, omegach2_main = 0.6756, 0.022, 0.120
+As_main, ns_main = 2.1e-9, 0.965
 
 # -- Global simulation parameters ---
 global_alpha = 1
@@ -37,17 +34,21 @@ a_end = 1.0
 n_steps = 50000
 phi_i_base = 10.5
 phi_prime_i_base = 0.28
+
+# Use the first with potential_flag=1 for the constant potential
 #default_guesses = {'V0': [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2]}
-potential_flag = 5 
+potential_flag = 5
+camb_potential_type = 3
+
 default_guesses = {'A':  [rho_cr * omega_de_target * 0.8, rho_cr * omega_de_target * 1.2]}
-inverse_power = 9
+inverse_power = 9 # V=A*\phi^(-9)
 
-# -- Results from HDS (ODEINT-Based) --
+# -- Results from HDS --
 
-from HDSSolver import global_alpha, find_all_phantom_crossings, find_w_phi_critical_points, run_full_simulation
+from HDSSolver import global_alpha, find_w_phi_critical_points, run_full_simulation
 
 results_HDS = run_full_simulation(
-                    potential_flag=potential_flag, # CAMB inverse power law
+                    potential_flag=potential_flag,
                     params_vector_to_shoot={'A': True, 'B': inverse_power},
                     a_ini=a_ini, a_end=a_end, n_steps=n_steps,
                     phi_i=phi_i_base, phi_prime_i=phi_prime_i_base,
@@ -58,7 +59,7 @@ results_HDS = run_full_simulation(
 params = camb.set_params(
         H0=100 * h_main, ombh2=omegabh2_main, omch2=omegach2_main, TCMB=2.7255,
         dark_energy_model='HybridQuintessence',
-        phi_i=phi_i_base, phi_prime_i=phi_prime_i_base, alpha=global_alpha, potential_type=3, beta=inverse_power,
+        phi_i=phi_i_base, phi_prime_i=phi_prime_i_base, alpha=global_alpha, potential_type=camb_potential_type, beta=inverse_power,
         omnuh2=0, num_nu_massless=3.044, num_nu_massive=0,
         nu_mass_degeneracies=[0], nu_mass_numbers=[0],
         As=As_main, ns=ns_main, tau=0.0544,
@@ -71,8 +72,6 @@ results_camb = camb.get_results(params)
 scale_factor_arr = results_HDS['a'] # using same array for both results
 
 rhos = results_camb.get_background_densities(scale_factor_arr)
-#   H was set to a*H(z), and then H_curly was set to a*H again (=> a^2 H).
-#   h_of_z already returns H(z). Conformal Hubble is H_curly = a*H.
 H = results_camb.h_of_z(1 / scale_factor_arr - 1)
 H_curly = scale_factor_arr * H
 _, w_de = results_camb.get_dark_energy_rho_w(scale_factor_arr)
@@ -97,8 +96,6 @@ w_eff = w_de + coupling_term
 #   In a^4*rho units, the non-interacting CDM baseline scales as ~a.
 delta_dm = -rho_cdm[0] * (scale_factor_arr / scale_factor_arr[0]) + rho_cdm
 w_ds = w_de / (1-delta_dm/rho_de)
-
-# Legacy direct full-array prints removed in favor of structured comparison below.
 
 results_camb_dict = {
     'a': scale_factor_arr,
@@ -133,10 +130,6 @@ def compare_all_compatible_results(
         ('a', 'a'),
         ('phi', 'phi'),
         ('phi_prime', 'phi_prime'),
-        # BEFORE:
-        #   CAMB a^4*rho arrays were compared against HDS physical-rho arrays.
-        # WHY THIS CHANGE:
-        #   Compare in the same density convention to remove pure unit mismatch.
         ('rho_de', 'rho_phi_a4'),
         ('rho_cdm', 'rho_dm_a4'),
         ('rho_b', 'rho_b_a4'),
@@ -185,9 +178,6 @@ def compare_all_compatible_results(
         p95_rel = float(np.percentile(rel_diff, 95))
         max_rel = float(np.max(rel_diff))
 
-        # Heuristic score: persistent mismatch + tail mismatch.
-        score = mean_rel + 0.25 * p95_rel
-
         rows.append({
             'pair': f'{camb_key} <-> {hds_key}',
             'mean_abs': mean_abs,
@@ -195,7 +185,6 @@ def compare_all_compatible_results(
             'mean_rel_pct': mean_rel,
             'p95_rel_pct': p95_rel,
             'max_rel_pct': max_rel,
-            'score': score,
         })
 
         n = min(3, c.size)
@@ -207,9 +196,9 @@ def compare_all_compatible_results(
             f"mean rel={mean_rel:.3e}%, p95 rel={p95_rel:.3e}%, max rel={max_rel:.3e}%"
         )
 
-    rows.sort(key=lambda r: r['score'], reverse=True)
+    rows.sort(key=lambda r: r['max_rel_pct'], reverse=True)
 
-    print("\n=== Most Incompatible Pairs (ranked) ===")
+    print("\n=== Most Incompatible Pairs (ranked by max rel %) ===")
     if not rows:
         print("No compatible numeric pairs found.")
         return rows
@@ -217,8 +206,8 @@ def compare_all_compatible_results(
     for i, row in enumerate(rows[:top_n], start=1):
         print(
             f"{i:>2}. {row['pair']}: "
-            f"score={row['score']:.3e}, mean rel={row['mean_rel_pct']:.3e}%, "
-            f"p95 rel={row['p95_rel_pct']:.3e}%, max rel={row['max_rel_pct']:.3e}%"
+            f"max rel={row['max_rel_pct']:.3e}%, mean rel={row['mean_rel_pct']:.3e}%, "
+            f"p95 rel={row['p95_rel_pct']:.3e}%"
         )
     return rows
 
